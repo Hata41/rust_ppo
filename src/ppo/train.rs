@@ -8,6 +8,7 @@ use burn::tensor::{Bool, ElementConversion, Tensor, TensorData};
 use burn::tensor::Int;
 use rand::seq::SliceRandom;
 use rand::{rngs::StdRng, SeedableRng};
+use rayon::prelude::*;
 use std::time::Instant;
 use tracing::{debug, info, span, Level};
 use rustpool::core::types::GenericObs;
@@ -39,29 +40,36 @@ fn build_binpack_batch_tensors<B: AutodiffBackend>(
     let mut items_valid_f32 = vec![0.0f32; batch * max_items];
     let mut ems_valid_f32 = vec![0.0f32; batch * max_ems];
 
-    for (row, obs) in obs_batch.iter().enumerate() {
-        let parsed = parse_binpack_obs(obs, max_items, max_ems)?;
+    obs_batch
+        .par_iter()
+        .zip(items.par_chunks_mut(max_items * 3))
+        .zip(ems.par_chunks_mut(max_ems * 6))
+        .zip(items_pad.par_chunks_mut(max_items))
+        .zip(ems_pad.par_chunks_mut(max_ems))
+        .zip(items_valid_f32.par_chunks_mut(max_items))
+        .zip(ems_valid_f32.par_chunks_mut(max_ems))
+        .try_for_each(
+            |((((((obs, items_row), ems_row), items_pad_row), ems_pad_row), items_valid_row), ems_valid_row)| -> Result<()> {
+                let parsed = parse_binpack_obs(obs, max_items, max_ems)?;
 
-        let item_base = row * max_items * 3;
-        items[item_base..item_base + max_items * 3].copy_from_slice(&parsed.items);
+                items_row.copy_from_slice(&parsed.items);
+                ems_row.copy_from_slice(&parsed.ems);
 
-        let ems_base = row * max_ems * 6;
-        ems[ems_base..ems_base + max_ems * 6].copy_from_slice(&parsed.ems);
+                for i in 0..max_items {
+                    let valid = parsed.items_valid[i];
+                    items_pad_row[i] = !valid;
+                    items_valid_row[i] = if valid { 1.0 } else { 0.0 };
+                }
 
-        let item_mask_base = row * max_items;
-        for i in 0..max_items {
-            let valid = parsed.items_valid[i];
-            items_pad[item_mask_base + i] = !valid;
-            items_valid_f32[item_mask_base + i] = if valid { 1.0 } else { 0.0 };
-        }
+                for i in 0..max_ems {
+                    let valid = parsed.ems_valid[i];
+                    ems_pad_row[i] = !valid;
+                    ems_valid_row[i] = if valid { 1.0 } else { 0.0 };
+                }
 
-        let ems_mask_base = row * max_ems;
-        for i in 0..max_ems {
-            let valid = parsed.ems_valid[i];
-            ems_pad[ems_mask_base + i] = !valid;
-            ems_valid_f32[ems_mask_base + i] = if valid { 1.0 } else { 0.0 };
-        }
-    }
+                Ok(())
+            },
+        )?;
 
     let items_t = Tensor::<B, 3>::from_data(TensorData::new(items, [batch, max_items, 3]), device);
     let ems_t = Tensor::<B, 3>::from_data(TensorData::new(ems, [batch, max_ems, 6]), device);
