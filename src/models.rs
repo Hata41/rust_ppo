@@ -1,11 +1,6 @@
-use burn::backend::autodiff::Autodiff;
-use burn::backend::cuda::Cuda;
 use burn::module::Module;
 use burn::nn::{Linear, LinearConfig};
 use burn::tensor::Tensor;
-
-pub type InnerBackend = Cuda<f32, i32>;
-pub type B = Autodiff<InnerBackend>;
 
 #[derive(Module, Clone, Debug)]
 pub struct Mlp<Bk: burn::tensor::backend::Backend> {

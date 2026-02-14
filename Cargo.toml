@@ -2,6 +2,7 @@
 name = "rust_ppo"
 version = "0.1.0"
 edition = "2021"
+build = "build.rs"
 
 [[bin]]
 name = "rust_ppo"
@@ -21,4 +22,5 @@ pyo3 = { version = "0.22", features = ["auto-initialize"] }
 rustpool = { path = "../rustpool", package = "_rustpool", default-features = false }
 
 # --- Burn (CUDA + autodiff) ---
-burn = { version = "0.20.1", features = ["cuda", "autodiff", "collective"] }
+burn = { version = "0.20.1", features = ["cuda", "autodiff", "collective", "ndarray"] }
+burn-ndarray = "0.20.1"

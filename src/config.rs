@@ -1,5 +1,11 @@
 use anyhow::{bail, Context, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
+
+#[derive(Copy, Clone, Debug, ValueEnum, Eq, PartialEq)]
+pub enum DeviceType {
+    Cuda,
+    Cpu,
+}
 
 #[derive(Parser, Debug, Clone)]
 #[command(name = "rust_ppo")]
@@ -83,6 +89,10 @@ pub struct Args {
     /// CUDA device index (0 = cuda:0)
     #[arg(long, default_value_t = 0)]
     pub cuda_device: usize,
+
+    /// Device backend to use: cuda or cpu
+    #[arg(long, value_enum, default_value_t = DeviceType::Cuda)]
+    pub device_type: DeviceType,
 
     /// Global rank (used if RANK env var is not set)
     #[arg(long, default_value_t = 0)]

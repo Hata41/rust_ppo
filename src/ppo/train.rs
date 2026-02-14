@@ -1,17 +1,17 @@
 use anyhow::{bail, Result};
-use burn::backend::cuda::CudaDevice;
+use burn::backend::cuda::Cuda;
 use burn::collective::{finish_collective, PeerId, ReduceOperation};
 use burn::module::{Module, ModuleVisitor, Param};
 use burn::optim::{AdamConfig, GradientsParams, Optimizer};
-use burn::prelude::Backend;
-use burn::tensor::{Tensor, TensorData};
+use burn::tensor::backend::AutodiffBackend;
+use burn::tensor::{ElementConversion, Tensor, TensorData};
 use burn::tensor::Int;
 use rand::seq::SliceRandom;
 use rand::{rngs::StdRng, SeedableRng};
 
 use crate::config::{Args, DistInfo};
 use crate::env::{make_env, AsyncEnvPool};
-use crate::models::{Actor, Agent, B, Critic, InnerBackend};
+use crate::models::{Actor, Agent, Critic};
 use crate::ppo::buffer::{flatten_obs, Rollout};
 use crate::ppo::loss::{compute_ppo_losses, logprob_and_entropy, sample_actions_gumbel};
 
@@ -34,14 +34,14 @@ impl<'a> GradSqAccumulator<'a> {
     }
 }
 
-impl<Bk: burn::tensor::backend::Backend> ModuleVisitor<Bk> for GradSqAccumulator<'_> {
+impl<Bk: AutodiffBackend> ModuleVisitor<Bk> for GradSqAccumulator<'_> {
     fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<Bk, D>>) {
-        if let Some(grad) = self.grads.get::<InnerBackend, D>(param.id) {
-            if let Ok(values) = grad.to_data().to_vec::<f32>() {
+        if let Some(grad) = self.grads.get::<Bk::InnerBackend, D>(param.id) {
+            if let Ok(values) = grad.to_data().to_vec::<Bk::FloatElem>() {
                 self.sum_sq += values
                     .iter()
                     .map(|v| {
-                        let x = *v as f64;
+                        let x: f64 = (*v).elem();
                         x * x
                     })
                     .sum::<f64>();
@@ -52,19 +52,19 @@ impl<Bk: burn::tensor::backend::Backend> ModuleVisitor<Bk> for GradSqAccumulator
 
 struct GradScaler<'a> {
     grads: &'a mut GradientsParams,
-    scale: f32,
+    scale: f64,
 }
 
-impl<Bk: burn::tensor::backend::Backend> ModuleVisitor<Bk> for GradScaler<'_> {
+impl<Bk: AutodiffBackend> ModuleVisitor<Bk> for GradScaler<'_> {
     fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<Bk, D>>) {
-        if let Some(grad) = self.grads.remove::<InnerBackend, D>(param.id) {
+        if let Some(grad) = self.grads.remove::<Bk::InnerBackend, D>(param.id) {
             self.grads
-                .register::<InnerBackend, D>(param.id, grad.mul_scalar(self.scale));
+                .register::<Bk::InnerBackend, D>(param.id, grad.mul_scalar(self.scale));
         }
     }
 }
 
-fn clip_global_grad_norm<Bk: burn::tensor::backend::Backend>(
+fn clip_global_grad_norm<Bk: AutodiffBackend>(
     actor: &Actor<Bk>,
     critic: &Critic<Bk>,
     grads_actor: &mut GradientsParams,
@@ -83,7 +83,7 @@ fn clip_global_grad_norm<Bk: burn::tensor::backend::Backend>(
 
     let total_norm = (actor_acc.sum_sq + critic_acc.sum_sq).sqrt() as f32;
     if total_norm > max_grad_norm {
-        let scale = max_grad_norm / (total_norm + 1.0e-6);
+        let scale = (max_grad_norm / (total_norm + 1.0e-6)) as f64;
 
         let mut actor_scaler = GradScaler {
             grads: grads_actor,
@@ -99,7 +99,7 @@ fn clip_global_grad_norm<Bk: burn::tensor::backend::Backend>(
     }
 }
 
-pub fn run(args: Args, dist: DistInfo, device: CudaDevice) -> Result<()> {
+pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) -> Result<()> {
     if args.num_envs == 0 {
         bail!("num_envs must be > 0");
     }
@@ -209,7 +209,16 @@ pub fn run(args: Args, dist: DistInfo, device: CudaDevice) -> Result<()> {
 
             let (logp_t, _ent_t) = logprob_and_entropy::<B>(logits, mask_t, actions_t.clone());
 
-            let actions_vec: Vec<i32> = actions_t.to_data().to_vec().unwrap();
+            let actions_data = actions_t.to_data();
+            let actions_vec: Vec<i32> = match actions_data.clone().to_vec::<i32>() {
+                Ok(v) => v,
+                Err(_) => actions_data
+                    .to_vec::<i64>()
+                    .map_err(|e| anyhow::anyhow!("failed to convert sampled actions: {e}"))?
+                    .into_iter()
+                    .map(|v| v as i32)
+                    .collect(),
+            };
             let logp_vec: Vec<f32> = logp_t.to_data().to_vec().unwrap();
             let values_vec: Vec<f32> = values.to_data().to_vec().unwrap();
 
@@ -342,10 +351,10 @@ pub fn run(args: Args, dist: DistInfo, device: CudaDevice) -> Result<()> {
 
                 if dist.world_size > 1 {
                     grads_actor = grads_actor
-                        .all_reduce::<InnerBackend>(peer_id, ReduceOperation::Mean)
+                        .all_reduce::<Cuda<f32, i32>>(peer_id, ReduceOperation::Mean)
                         .map_err(|e| anyhow::anyhow!("failed actor gradient all-reduce: {e:?}"))?;
                     grads_critic = grads_critic
-                        .all_reduce::<InnerBackend>(peer_id, ReduceOperation::Mean)
+                        .all_reduce::<Cuda<f32, i32>>(peer_id, ReduceOperation::Mean)
                         .map_err(|e| anyhow::anyhow!("failed critic gradient all-reduce: {e:?}"))?;
                 }
 
@@ -383,7 +392,7 @@ pub fn run(args: Args, dist: DistInfo, device: CudaDevice) -> Result<()> {
     }
 
     if dist.world_size > 1 {
-        finish_collective::<InnerBackend>(peer_id)
+        finish_collective::<Cuda<f32, i32>>(peer_id)
             .map_err(|e| anyhow::anyhow!("failed to finish burn collective: {e:?}"))?;
     }
 
