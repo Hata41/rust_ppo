@@ -21,4 +21,4 @@ pyo3 = { version = "0.22", features = ["auto-initialize"] }
 rustpool = { path = "../rustpool", package = "_rustpool", default-features = false }
 
 # --- Burn (CUDA + autodiff) ---
-burn = { version = "0.20.1", features = ["cuda", "autodiff"] }
+burn = { version = "0.20.1", features = ["cuda", "autodiff", "collective"] }

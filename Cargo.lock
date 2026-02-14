@@ -780,6 +780,7 @@ version = "0.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5a8c376d835d92ea363c05c6f48ac19bb687b683c7958c310a716ef8d5d77ba3"
 dependencies = [
+ "burn-collective",
  "burn-core",
  "derive-new",
  "hashbrown 0.16.1",
@@ -910,6 +911,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6c3128c7571992c382a5ad057c72654c1048ea4dcf138d1f394313047e69803a"
 dependencies = [
  "async-channel",
+ "burn-collective",
  "burn-core",
  "burn-ndarray",
  "burn-optim",
@@ -4205,20 +4207,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "439ee305def115ba05938db6eb1644ff94165c5ab5e9420d1c1bcedbba909391"
 
 [[package]]
-name = "ppo-burn-anakin"
-version = "0.1.0"
-dependencies = [
- "_rustpool",
- "anyhow",
- "bitvec",
- "burn",
- "clap",
- "crossbeam-channel",
- "pyo3",
- "rand 0.8.5",
-]
-
-[[package]]
 name = "ppv-lite86"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4883,6 +4871,20 @@ dependencies = [
  "hashlink",
  "libsqlite3-sys",
  "smallvec",
+]
+
+[[package]]
+name = "rust_ppo"
+version = "0.1.0"
+dependencies = [
+ "_rustpool",
+ "anyhow",
+ "bitvec",
+ "burn",
+ "clap",
+ "crossbeam-channel",
+ "pyo3",
+ "rand 0.8.5",
 ]
 
 [[package]]
