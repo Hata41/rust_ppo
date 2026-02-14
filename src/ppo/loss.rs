@@ -29,20 +29,23 @@ pub fn logprob_and_entropy<Bk: burn::tensor::backend::Backend>(
     (chosen_lp, ent)
 }
 
-pub fn sample_actions_gumbel<Bk: burn::tensor::backend::Backend>(
+pub fn sample_actions_categorical<Bk: burn::tensor::backend::Backend>(
     logits: Tensor<Bk, 2>,
     mask_f32: Tensor<Bk, 2>,
     device: &Bk::Device,
 ) -> Tensor<Bk, 1, Int> {
     let masked = masked_logits(logits, mask_f32);
+    let probs = softmax(masked, 1);
+    let [batch_size, _action_dim] = probs.dims();
 
-    let [b, a] = masked.dims();
+    let u = Tensor::<Bk, 2>::random(
+        [batch_size, 1],
+        Distribution::Uniform(1.0e-6, 1.0 - 1.0e-6),
+        device,
+    );
+    let cdf = probs.cumsum(1);
 
-    let u = Tensor::<Bk, 2>::random([b, a], Distribution::Uniform(1.0e-6, 1.0 - 1.0e-6), device);
-    let g = (u.log().neg()).log().neg();
-    let noisy = masked + g;
-
-    noisy.argmax(1).squeeze::<1>()
+    cdf.lower(u).int().sum_dim(1).squeeze::<1>()
 }
 
 pub struct PpoLossParts<Bk: burn::tensor::backend::Backend> {

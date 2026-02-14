@@ -19,7 +19,7 @@ use crate::env::{make_env, AsyncEnvPool};
 use crate::models::{Actor, Agent, Critic};
 use crate::ppo::buffer::{flatten_obs, parse_binpack_obs, Rollout};
 use crate::ppo::loss::{
-    compute_ppo_losses, logprob_and_entropy, masked_logits, sample_actions_gumbel,
+    compute_ppo_losses, logprob_and_entropy, masked_logits, sample_actions_categorical,
 };
 
 fn build_binpack_batch_tensors<B: AutodiffBackend>(
@@ -250,7 +250,9 @@ fn run_deterministic_eval<B: AutodiffBackend>(
             agent.actor.forward(obs_t).detach()
         };
 
-        let actions_t = masked_logits(logits, mask_t).argmax(1).squeeze::<1>();
+        let masked = masked_logits(logits, mask_t);
+        let probs = burn::tensor::activation::softmax(masked, 1);
+        let actions_t = probs.argmax(1).squeeze::<1>();
 
         let actions_data = actions_t.to_data();
         let actions_vec: Vec<i32> = match actions_data.clone().to_vec::<i32>() {
@@ -500,7 +502,7 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                 };
                 let values = values2.reshape([local_num_envs]);
 
-                let actions_t = sample_actions_gumbel::<B>(logits.clone(), mask_t.clone(), &device);
+                let actions_t = sample_actions_categorical::<B>(logits.clone(), mask_t.clone(), &device);
 
                 let (logp_t, _ent_t) = logprob_and_entropy::<B>(logits, mask_t, actions_t.clone());
 
