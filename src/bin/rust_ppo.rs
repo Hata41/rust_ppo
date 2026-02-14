@@ -3,7 +3,6 @@ use burn::backend::autodiff::Autodiff;
 use burn::backend::cuda::{Cuda, CudaDevice};
 use burn::collective::{register, CollectiveConfig, PeerId};
 use burn_ndarray::{NdArray, NdArrayDevice};
-use clap::Parser;
 use std::fmt;
 use tracing::field::{Field, Visit};
 use tracing::{Event, Subscriber};
@@ -147,7 +146,7 @@ where
 }
 
 fn main() -> Result<()> {
-    let args = Args::parse();
+    let args = Args::load()?;
     let dist = DistInfo::from_env_or_args(&args)?;
 
     if dist.rank == 0 {

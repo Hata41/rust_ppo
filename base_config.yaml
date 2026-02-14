@@ -1,0 +1,76 @@
+# Base configuration template for rust_ppo.
+# Precedence order at runtime is:
+#   built-in defaults < values in this file < explicit CLI flags
+
+environment:
+  # rustpool task id (examples: "BinPack-v0", "Maze-v0")
+  task_id: "BinPack-v0"
+  # Number of parallel training environments
+  num_envs: 64
+  # BinPack-specific max number of items in an instance
+  max_items: 20
+  # BinPack-specific max number of EMS entries
+  max_ems: 40
+  # Max steps before an episode is truncated (if used by env)
+  max_episode_steps: 200
+
+ppo_core:
+  # Trajectory horizon T per environment per PPO update
+  rollout_length: 20
+  # Total PPO updates
+  num_updates: 2000
+  # PPO epochs over each collected rollout buffer
+  epochs: 1
+  # Number of minibatches per epoch
+  num_minibatches: 2
+  # Reward discount factor
+  gamma: 0.99
+  # GAE lambda
+  gae_lambda: 0.95
+
+optimization:
+  # Learning rate for actor optimizer
+  actor_lr: 0.0003
+  # Learning rate for critic optimizer
+  critic_lr: 0.001
+  # Clip global gradient norm at this threshold
+  max_grad_norm: 0.5
+  # PPO clipping epsilon
+  clip_eps: 0.2
+  # Entropy regularization coefficient
+  ent_coef: 0.01
+  # Value function loss coefficient
+  vf_coef: 0.5
+  # Linearly decay learning rates over num_updates
+  decay_learning_rates: true
+  # Standardize advantages before policy updates
+  standardize_advantages: true
+  # Reward scaling factor applied before GAE
+  reward_scale: 1.0
+
+architecture:
+  # Hidden layer width for model MLPs
+  hidden_dim: 16
+  # Random seed
+  seed: 0
+
+evaluation:
+  # Run deterministic evaluation every N updates
+  eval_interval: 2
+  # Number of parallel environments used during evaluation
+  num_eval_envs: 50
+  # Number of completed episodes to aggregate per eval phase
+  num_eval_episodes: 200
+
+hardware:
+  # "cuda" or "cpu"
+  device_type: "cpu"
+  # CUDA device index used in single-process mode
+  cuda_device: 0
+
+distributed:
+  # Fallback distributed values if env vars are missing.
+  # Env vars (RANK, WORLD_SIZE, LOCAL_RANK) still take priority.
+  rank: 0
+  world_size: 1
+  local_rank: 0
