@@ -36,6 +36,12 @@ cargo check
 cargo run --release -- --config base_config.yaml
 ```
 
+### 3b) Run SPO with template config
+
+```bash
+cargo run --release --bin rust_spo -- --config spo_config.yaml
+```
+
 ### 4) Override config values from CLI
 
 ```bash
@@ -64,6 +70,12 @@ cargo run --release -- \
   --config base_config.yaml \
   --task-id Maze-v0 \
   --device-type cpu
+```
+
+### SPO BinPack on CPU (config-only)
+
+```bash
+cargo run --release --bin rust_spo -- --config spo_config.yaml
 ```
 
 ### Distributed CUDA (2 processes example)

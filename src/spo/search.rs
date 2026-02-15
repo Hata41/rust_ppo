@@ -1,0 +1,379 @@
+use anyhow::{bail, Result};
+use burn::tensor::backend::Backend;
+use burn::tensor::{Tensor, TensorData};
+use rand::distributions::{Distribution as RandDistribution, WeightedIndex};
+use rand::Rng;
+use rand_distr::Gamma;
+
+use crate::env::{AsyncEnvPool, StepOut};
+use crate::models::Agent;
+use crate::ppo::loss::sample_actions_categorical;
+use crate::spo::buffer::flatten_obs_once;
+
+#[derive(Clone, Copy, Debug)]
+pub struct SearchConfig {
+    pub num_particles: usize,
+    pub search_depth: usize,
+    pub search_gamma: f32,
+    pub resampling_period: usize,
+    pub resampling_ess_threshold: f32,
+    pub adaptive_temperature: bool,
+    pub fixed_temperature: f32,
+    pub root_exploration_dirichlet_alpha: f32,
+    pub root_exploration_dirichlet_fraction: f32,
+}
+
+pub struct SearchOut {
+    pub root_actions: Vec<i32>,
+    pub root_action_weights: Vec<f32>,
+    pub leaf_steps: Vec<StepOut>,
+    pub leaf_state_ids: Vec<i32>,
+}
+
+fn softmax(values: &[f32]) -> Vec<f32> {
+    let max_v = values
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, |a, b| if a > b { a } else { b });
+    let exps = values
+        .iter()
+        .map(|v| (v - max_v).exp())
+        .collect::<Vec<_>>();
+    let denom = exps.iter().sum::<f32>().max(1.0e-12);
+    exps.into_iter().map(|x| x / denom).collect()
+}
+
+fn normalize_weights(weights: &mut [f32]) {
+    let sum_w = weights.iter().sum::<f32>();
+    if sum_w <= 0.0 || !sum_w.is_finite() {
+        let uniform = 1.0 / (weights.len() as f32).max(1.0);
+        for w in weights.iter_mut() {
+            *w = uniform;
+        }
+        return;
+    }
+    for w in weights.iter_mut() {
+        *w /= sum_w;
+    }
+}
+
+fn effective_sample_size(weights: &[f32]) -> f32 {
+    let denom = weights.iter().map(|w| w * w).sum::<f32>().max(1.0e-12);
+    1.0 / denom
+}
+
+fn resample_indices<R: Rng + ?Sized>(weights: &[f32], num_samples: usize, rng: &mut R) -> Vec<usize> {
+    let dist = WeightedIndex::new(weights)
+        .ok()
+        .or_else(|| WeightedIndex::new(vec![1.0f32; weights.len()]).ok());
+    match dist {
+        Some(d) => (0..num_samples).map(|_| d.sample(rng)).collect(),
+        None => (0..num_samples).collect(),
+    }
+}
+
+fn sample_dirichlet<R: Rng + ?Sized>(alpha: f32, dim: usize, rng: &mut R) -> Vec<f32> {
+    let safe_alpha = alpha.max(1.0e-3) as f64;
+    let gamma = Gamma::new(safe_alpha, 1.0).ok();
+    let mut draws = vec![0.0f32; dim];
+    let mut sum_draw = 0.0f32;
+    for d in draws.iter_mut() {
+        let v = gamma
+            .as_ref()
+            .map(|g| g.sample(rng) as f32)
+            .unwrap_or(1.0);
+        *d = v;
+        sum_draw += v;
+    }
+    if sum_draw <= 0.0 || !sum_draw.is_finite() {
+        let uniform = 1.0 / dim.max(1) as f32;
+        return vec![uniform; dim];
+    }
+    for d in draws.iter_mut() {
+        *d /= sum_draw;
+    }
+    draws
+}
+
+pub fn flatten_particle_actions(actions: &[i32], num_particles: usize) -> Vec<i32> {
+    let mut out = Vec::with_capacity(actions.len() * num_particles);
+    for &a in actions {
+        for _ in 0..num_particles {
+            out.push(a);
+        }
+    }
+    out
+}
+
+pub fn expand_state_ids(state_ids: &[i32], num_particles: usize) -> Vec<i32> {
+    let mut out = Vec::with_capacity(state_ids.len() * num_particles);
+    for &sid in state_ids {
+        for _ in 0..num_particles {
+            out.push(sid);
+        }
+    }
+    out
+}
+
+pub fn one_depth_simulation(
+    env: &AsyncEnvPool,
+    root_state_ids: &[i32],
+    root_actions: &[i32],
+    num_particles: usize,
+) -> Result<Vec<StepOut>> {
+    if root_state_ids.len() != root_actions.len() {
+        bail!(
+            "state/action mismatch at search root: {} vs {}",
+            root_state_ids.len(),
+            root_actions.len()
+        );
+    }
+    let expanded_state_ids = expand_state_ids(root_state_ids, num_particles);
+    let expanded_actions = flatten_particle_actions(root_actions, num_particles);
+
+    let simulated = env.simulate_batch(&expanded_state_ids, &expanded_actions)?;
+    Ok(simulated)
+}
+
+pub fn run_smc_search<B: Backend>(
+    env: &AsyncEnvPool,
+    agent: &Agent<B>,
+    root_state_ids: &[i32],
+    root_obs: &[rustpool::core::types::GenericObs],
+    root_action_masks: &[Vec<bool>],
+    cfg: SearchConfig,
+    obs_dim: usize,
+    action_dim: usize,
+    device: &B::Device,
+    rng: &mut impl Rng,
+) -> Result<SearchOut> {
+    if root_state_ids.len() != root_obs.len() || root_state_ids.len() != root_action_masks.len() {
+        bail!(
+            "state/obs/mask mismatch at search root: {} vs {} vs {}",
+            root_state_ids.len(),
+            root_obs.len(),
+            root_action_masks.len()
+        );
+    }
+    if cfg.num_particles == 0 {
+        bail!("num_particles must be > 0");
+    }
+    if cfg.search_depth == 0 {
+        bail!("search_depth must be > 0");
+    }
+
+    let batch = root_state_ids.len();
+    let mut current_state_ids = expand_state_ids(root_state_ids, cfg.num_particles);
+    let mut current_obs = Vec::with_capacity(batch * cfg.num_particles);
+    let mut current_masks = Vec::with_capacity(batch * cfg.num_particles);
+    for idx in 0..batch {
+        for _ in 0..cfg.num_particles {
+            current_obs.push(root_obs[idx].clone());
+            current_masks.push(root_action_masks[idx].clone());
+        }
+    }
+
+    debug_assert_eq!(current_state_ids.len(), batch * cfg.num_particles);
+    debug_assert_eq!(current_obs.len(), batch * cfg.num_particles);
+
+    let mut last_steps = Vec::new();
+    let mut root_actions = vec![0i32; batch];
+    let mut root_particle_actions = vec![0i32; batch * cfg.num_particles];
+    let mut particle_returns = vec![0.0f32; batch * cfg.num_particles];
+    let mut particle_weights = vec![1.0f32 / (cfg.num_particles as f32); batch * cfg.num_particles];
+
+    for depth_idx in 0..cfg.search_depth {
+        let n = current_obs.len();
+        let mut obs_flat = Vec::with_capacity(n * obs_dim);
+        let mut mask_flat = Vec::with_capacity(n * action_dim);
+        for (obs, mask) in current_obs.iter().zip(current_masks.iter()) {
+            let obs_vec = flatten_obs_once(obs)?;
+            if obs_vec.len() != obs_dim {
+                bail!("search obs dim mismatch: got {}, expected {}", obs_vec.len(), obs_dim);
+            }
+            if mask.len() != action_dim {
+                bail!("search action mask mismatch: got {}, expected {}", mask.len(), action_dim);
+            }
+            obs_flat.extend_from_slice(&obs_vec);
+            for &m in mask {
+                mask_flat.push(if m { 1.0 } else { 0.0 });
+            }
+        }
+
+        let obs_t = Tensor::<B, 2>::from_data(TensorData::new(obs_flat, [n, obs_dim]), device);
+        let mask_t = Tensor::<B, 2>::from_data(TensorData::new(mask_flat, [n, action_dim]), device);
+        let logits = agent.actor.forward(obs_t);
+        let actions_t = sample_actions_categorical(logits, mask_t, device);
+        let actions_data = actions_t.to_data();
+        let actions = match actions_data.clone().to_vec::<i32>() {
+            Ok(v) => v,
+            Err(_) => actions_data
+                .to_vec::<i64>()
+                .map_err(|e| anyhow::anyhow!("failed to convert sampled actions: {e}"))?
+                .into_iter()
+                .map(|v| v as i32)
+                .collect(),
+        };
+
+        if depth_idx == 0 {
+            root_particle_actions.copy_from_slice(&actions);
+        }
+
+        let steps = env.simulate_batch(&current_state_ids, &actions)?;
+
+        let discount = cfg.search_gamma.powi(depth_idx as i32);
+        for i in 0..steps.len() {
+            particle_returns[i] += discount * steps[i].reward;
+        }
+
+        for env_idx in 0..batch {
+            let start = env_idx * cfg.num_particles;
+            let end = start + cfg.num_particles;
+            let returns = &particle_returns[start..end];
+            let temperature = if cfg.adaptive_temperature {
+                let mean = returns.iter().sum::<f32>() / cfg.num_particles as f32;
+                let var = returns
+                    .iter()
+                    .map(|r| {
+                        let d = *r - mean;
+                        d * d
+                    })
+                    .sum::<f32>()
+                    / cfg.num_particles as f32;
+                var.sqrt().max(1.0e-3)
+            } else {
+                cfg.fixed_temperature.max(1.0e-3)
+            };
+            let logits = returns.iter().map(|r| *r / temperature).collect::<Vec<_>>();
+            let w = softmax(&logits);
+            particle_weights[start..end].copy_from_slice(&w);
+        }
+
+        if depth_idx + 1 < cfg.search_depth {
+            let mut next_state_ids = Vec::with_capacity(batch * cfg.num_particles);
+            let mut next_obs = Vec::with_capacity(batch * cfg.num_particles);
+            let mut next_masks = Vec::with_capacity(batch * cfg.num_particles);
+            let mut next_returns = Vec::with_capacity(batch * cfg.num_particles);
+            let mut next_weights = Vec::with_capacity(batch * cfg.num_particles);
+
+            for env_idx in 0..batch {
+                let start = env_idx * cfg.num_particles;
+                let end = start + cfg.num_particles;
+                let w = &particle_weights[start..end];
+                let ess = effective_sample_size(w);
+                let periodic_trigger =
+                    cfg.resampling_period > 0 && (depth_idx + 1) % cfg.resampling_period == 0;
+                let ess_trigger = ess < cfg.resampling_ess_threshold * cfg.num_particles as f32;
+
+                if periodic_trigger || ess_trigger {
+                    let sampled = resample_indices(w, cfg.num_particles, rng);
+                    for &j in sampled.iter() {
+                        let idx = start + j;
+                        next_state_ids.push(
+                            steps[idx]
+                                .state_ids
+                                .first()
+                                .copied()
+                                .ok_or_else(|| anyhow::anyhow!("simulate_batch returned empty state_ids"))?,
+                        );
+                        next_obs.push(steps[idx].obs.clone());
+                        next_masks.push(steps[idx].action_mask.clone());
+                        next_returns.push(particle_returns[idx]);
+                    }
+                    let uniform = 1.0 / cfg.num_particles as f32;
+                    for _ in 0..cfg.num_particles {
+                        next_weights.push(uniform);
+                    }
+                } else {
+                    for idx in start..end {
+                        next_state_ids.push(
+                            steps[idx]
+                                .state_ids
+                                .first()
+                                .copied()
+                                .ok_or_else(|| anyhow::anyhow!("simulate_batch returned empty state_ids"))?,
+                        );
+                        next_obs.push(steps[idx].obs.clone());
+                        next_masks.push(steps[idx].action_mask.clone());
+                        next_returns.push(particle_returns[idx]);
+                        next_weights.push(particle_weights[idx]);
+                    }
+                }
+            }
+
+            let mut released = current_state_ids.clone();
+            released.sort_unstable();
+            released.dedup();
+            env.release_batch(&released);
+
+            current_state_ids = next_state_ids;
+            current_obs = next_obs;
+            current_masks = next_masks;
+            particle_returns = next_returns;
+            particle_weights = next_weights;
+        } else {
+            let mut released = current_state_ids.clone();
+            released.sort_unstable();
+            released.dedup();
+            env.release_batch(&released);
+
+            current_state_ids = steps
+                .iter()
+                .map(|step| {
+                    step.state_ids
+                        .first()
+                        .copied()
+                        .ok_or_else(|| anyhow::anyhow!("simulate_batch returned empty state_ids"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+        }
+
+        last_steps = steps;
+    }
+
+    let mut root_action_weights = vec![0.0f32; batch * action_dim];
+    for env_idx in 0..batch {
+        let start = env_idx * cfg.num_particles;
+        let end = start + cfg.num_particles;
+        let mut action_probs = vec![0.0f32; action_dim];
+        for p in start..end {
+            let action = root_particle_actions[p] as usize;
+            if action < action_dim {
+                action_probs[action] += particle_weights[p];
+            }
+        }
+
+        if cfg.root_exploration_dirichlet_fraction > 0.0 {
+            let frac = cfg.root_exploration_dirichlet_fraction.clamp(0.0, 1.0);
+            let dir_noise = sample_dirichlet(
+                cfg.root_exploration_dirichlet_alpha,
+                action_dim,
+                rng,
+            );
+            for a in 0..action_dim {
+                action_probs[a] = (1.0 - frac) * action_probs[a] + frac * dir_noise[a];
+            }
+        }
+
+        normalize_weights(&mut action_probs);
+        let chooser = WeightedIndex::new(&action_probs)
+            .ok()
+            .or_else(|| WeightedIndex::new(vec![1.0f32; action_dim]).ok())
+            .ok_or_else(|| anyhow::anyhow!("failed to build root action sampler"))?;
+        root_actions[env_idx] = chooser.sample(rng) as i32;
+        let row0 = env_idx * action_dim;
+        root_action_weights[row0..row0 + action_dim].copy_from_slice(&action_probs);
+    }
+
+    let leaf_state_ids = last_steps
+        .iter()
+        .filter_map(|s| s.state_ids.first().copied())
+        .collect::<Vec<_>>();
+
+    Ok(SearchOut {
+        root_actions,
+        root_action_weights,
+        leaf_steps: last_steps,
+        leaf_state_ids,
+    })
+}

@@ -14,7 +14,7 @@ environment:
   # Max steps before an episode is truncated (if used by env)
   max_episode_steps: 200
 
-ppo_core:
+training_core:
   # Trajectory horizon T per environment per PPO update
   rollout_length: 20
   # Total PPO updates

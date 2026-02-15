@@ -38,12 +38,18 @@ Source pointers:
 ## Main groups
 
 - `environment`: task/env cardinality and env-specific limits
-- `ppo_core`: rollout/epoch/minibatch core algorithm knobs
+- `training_core`: rollout/epoch/minibatch core algorithm knobs
 - `optimization`: LR, clip, entropy, vf, grad clipping, scaling/standardization
 - `architecture`: hidden dim and seed
 - `evaluation`: deterministic eval cadence and volume
 - `hardware`: backend and device index
 - `distributed`: rank/world-size/local-rank fallbacks
+- `spo`: search/MPO-specific controls used by `rust_spo`
+
+Both binaries use the same config load pipeline (`Args::load`):
+
+- PPO: `cargo run --release -- --config base_config.yaml`
+- SPO: `cargo run --release --bin rust_spo -- --config spo_config.yaml`
 
 ## Common pitfalls
 

@@ -1,0 +1,61 @@
+# SPO-focused configuration template for rust_spo.
+# Precedence at runtime:
+#   built-in defaults < values in this file < explicit CLI flags
+
+environment:
+  task_id: "BinPack-v0"
+  num_envs: 8
+  max_items: 20
+  max_ems: 40
+  max_episode_steps: 80
+
+training_core:
+  # Used by SPO trainer for rollout/update scheduling.
+  rollout_length: 8
+  num_updates: 20
+  epochs: 1
+  num_minibatches: 4
+  gamma: 0.99
+
+optimization:
+  actor_lr: 0.0003
+  critic_lr: 0.0003
+  # Soft target-network update coefficient (used by SPO).
+  tau: 0.005
+
+architecture:
+  hidden_dim: 8
+  seed: 42
+
+evaluation:
+  eval_interval: 5
+  num_eval_envs: 8
+  num_eval_episodes: 8
+
+hardware:
+  device_type: "cpu"
+  cuda_device: 0
+
+distributed:
+  rank: 0
+  world_size: 1
+  local_rank: 0
+
+spo:
+  num_particles: 4
+  search_depth: 2
+  replay_buffer_size: 512
+  sample_sequence_length: 8
+  dual_lr: 0.001
+  epsilon: 0.5
+  epsilon_policy: 0.001
+  init_log_temperature: 3.0
+  init_log_alpha: 3.0
+  search_gamma: 1.0
+  search_gae_lambda: 1.0
+  root_exploration_dirichlet_alpha: 1.0
+  root_exploration_dirichlet_fraction: 0.0
+  resampling_period: 4
+  resampling_ess_threshold: 0.5
+  adaptive_temperature: true
+  fixed_temperature: 0.5

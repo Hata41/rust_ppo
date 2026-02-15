@@ -85,6 +85,10 @@ pub struct Args {
     #[arg(long, default_value_t = 0.5)]
     pub max_grad_norm: f32,
 
+    /// Soft target-network update coefficient for SPO
+    #[arg(long, default_value_t = 0.005)]
+    pub tau: f64,
+
     /// Linearly decay actor/critic learning rates over updates
     #[arg(long, default_value_t = true)]
     pub decay_learning_rates: bool,
@@ -134,6 +138,74 @@ pub struct Args {
     /// Max episode steps (used by some envs internally; rustpool auto-resets on done)
     #[arg(long, default_value_t = 200)]
     pub max_episode_steps: usize,
+
+    /// SPO: number of search particles per environment.
+    #[arg(long, default_value_t = 16)]
+    pub num_particles: usize,
+
+    /// SPO: search depth for SMC rollout.
+    #[arg(long, default_value_t = 4)]
+    pub search_depth: usize,
+
+    /// SPO: replay buffer capacity in transitions.
+    #[arg(long, default_value_t = 65_536)]
+    pub replay_buffer_size: usize,
+
+    /// SPO: sampled sequence length from replay.
+    #[arg(long, default_value_t = 32)]
+    pub sample_sequence_length: usize,
+
+    /// SPO: dual optimizer learning rate.
+    #[arg(long, default_value_t = 1e-3)]
+    pub dual_lr: f64,
+
+    /// SPO/MPO: E-step KL constraint.
+    #[arg(long, default_value_t = 0.5)]
+    pub epsilon: f32,
+
+    /// SPO/MPO: policy KL constraint.
+    #[arg(long, default_value_t = 1e-3)]
+    pub epsilon_policy: f32,
+
+    /// SPO/MPO: initial log temperature.
+    #[arg(long, default_value_t = 3.0)]
+    pub init_log_temperature: f32,
+
+    /// SPO/MPO: initial log alpha.
+    #[arg(long, default_value_t = 3.0)]
+    pub init_log_alpha: f32,
+
+    /// SPO: search discount factor.
+    #[arg(long, default_value_t = 1.0)]
+    pub search_gamma: f32,
+
+    /// SPO: search GAE lambda.
+    #[arg(long, default_value_t = 1.0)]
+    pub search_gae_lambda: f32,
+
+    /// SPO: root Dirichlet alpha for exploration.
+    #[arg(long, default_value_t = 1.0)]
+    pub root_exploration_dirichlet_alpha: f32,
+
+    /// SPO: root Dirichlet mixing fraction.
+    #[arg(long, default_value_t = 0.0)]
+    pub root_exploration_dirichlet_fraction: f32,
+
+    /// SPO: resampling period in steps.
+    #[arg(long, default_value_t = 4)]
+    pub resampling_period: usize,
+
+    /// SPO: effective sample size threshold for resampling.
+    #[arg(long, default_value_t = 0.5)]
+    pub resampling_ess_threshold: f32,
+
+    /// SPO: adaptive temperature flag.
+    #[arg(long, default_value_t = true)]
+    pub adaptive_temperature: bool,
+
+    /// SPO: fixed temperature fallback when adaptive is disabled.
+    #[arg(long, default_value_t = 0.5)]
+    pub fixed_temperature: f32,
 }
 
 impl Default for Args {
@@ -157,6 +229,7 @@ impl Default for Args {
             actor_lr: 3e-4,
             critic_lr: 1e-3,
             max_grad_norm: 0.5,
+            tau: 0.005,
             decay_learning_rates: true,
             reward_scale: 1.0,
             standardize_advantages: true,
@@ -170,6 +243,23 @@ impl Default for Args {
             max_items: 20,
             max_ems: 40,
             max_episode_steps: 200,
+            num_particles: 16,
+            search_depth: 4,
+            replay_buffer_size: 65_536,
+            sample_sequence_length: 32,
+            dual_lr: 1e-3,
+            epsilon: 0.5,
+            epsilon_policy: 1e-3,
+            init_log_temperature: 3.0,
+            init_log_alpha: 3.0,
+            search_gamma: 1.0,
+            search_gae_lambda: 1.0,
+            root_exploration_dirichlet_alpha: 1.0,
+            root_exploration_dirichlet_fraction: 0.0,
+            resampling_period: 4,
+            resampling_ess_threshold: 0.5,
+            adaptive_temperature: true,
+            fixed_temperature: 0.5,
         }
     }
 }
@@ -178,12 +268,14 @@ impl Default for Args {
 #[serde(default, deny_unknown_fields)]
 struct FileConfig {
     environment: EnvironmentConfig,
-    ppo_core: PpoCoreConfig,
+    #[serde(alias = "ppo_core")]
+    training_core: TrainingCoreConfig,
     optimization: OptimizationConfig,
     architecture: ArchitectureConfig,
     evaluation: EvaluationConfig,
     hardware: HardwareConfig,
     distributed: DistributedConfig,
+    spo: SpoConfig,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -198,7 +290,7 @@ struct EnvironmentConfig {
 
 #[derive(Debug, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
-struct PpoCoreConfig {
+struct TrainingCoreConfig {
     rollout_length: Option<usize>,
     num_updates: Option<usize>,
     epochs: Option<usize>,
@@ -219,6 +311,29 @@ struct OptimizationConfig {
     decay_learning_rates: Option<bool>,
     standardize_advantages: Option<bool>,
     reward_scale: Option<f32>,
+    tau: Option<f64>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct SpoConfig {
+    num_particles: Option<usize>,
+    search_depth: Option<usize>,
+    replay_buffer_size: Option<usize>,
+    sample_sequence_length: Option<usize>,
+    dual_lr: Option<f64>,
+    epsilon: Option<f32>,
+    epsilon_policy: Option<f32>,
+    init_log_temperature: Option<f32>,
+    init_log_alpha: Option<f32>,
+    search_gamma: Option<f32>,
+    search_gae_lambda: Option<f32>,
+    root_exploration_dirichlet_alpha: Option<f32>,
+    root_exploration_dirichlet_fraction: Option<f32>,
+    resampling_period: Option<usize>,
+    resampling_ess_threshold: Option<f32>,
+    adaptive_temperature: Option<bool>,
+    fixed_temperature: Option<f32>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -306,12 +421,12 @@ impl Args {
         set_if_some!(max_ems, file.environment.max_ems);
         set_if_some!(max_episode_steps, file.environment.max_episode_steps);
 
-        set_if_some!(rollout_length, file.ppo_core.rollout_length);
-        set_if_some!(num_updates, file.ppo_core.num_updates);
-        set_if_some!(epochs, file.ppo_core.epochs);
-        set_if_some!(num_minibatches, file.ppo_core.num_minibatches);
-        set_if_some!(gamma, file.ppo_core.gamma);
-        set_if_some!(gae_lambda, file.ppo_core.gae_lambda);
+        set_if_some!(rollout_length, file.training_core.rollout_length);
+        set_if_some!(num_updates, file.training_core.num_updates);
+        set_if_some!(epochs, file.training_core.epochs);
+        set_if_some!(num_minibatches, file.training_core.num_minibatches);
+        set_if_some!(gamma, file.training_core.gamma);
+        set_if_some!(gae_lambda, file.training_core.gae_lambda);
 
         set_if_some!(actor_lr, file.optimization.actor_lr);
         set_if_some!(critic_lr, file.optimization.critic_lr);
@@ -322,6 +437,7 @@ impl Args {
         set_if_some!(decay_learning_rates, file.optimization.decay_learning_rates);
         set_if_some!(standardize_advantages, file.optimization.standardize_advantages);
         set_if_some!(reward_scale, file.optimization.reward_scale);
+        set_if_some!(tau, file.optimization.tau);
 
         set_if_some!(hidden_dim, file.architecture.hidden_dim);
         set_if_some!(seed, file.architecture.seed);
@@ -336,6 +452,24 @@ impl Args {
         set_if_some!(rank, file.distributed.rank);
         set_if_some!(world_size, file.distributed.world_size);
         set_if_some!(local_rank, file.distributed.local_rank);
+
+        set_if_some!(num_particles, file.spo.num_particles);
+        set_if_some!(search_depth, file.spo.search_depth);
+        set_if_some!(replay_buffer_size, file.spo.replay_buffer_size);
+        set_if_some!(sample_sequence_length, file.spo.sample_sequence_length);
+        set_if_some!(dual_lr, file.spo.dual_lr);
+        set_if_some!(epsilon, file.spo.epsilon);
+        set_if_some!(epsilon_policy, file.spo.epsilon_policy);
+        set_if_some!(init_log_temperature, file.spo.init_log_temperature);
+        set_if_some!(init_log_alpha, file.spo.init_log_alpha);
+        set_if_some!(search_gamma, file.spo.search_gamma);
+        set_if_some!(search_gae_lambda, file.spo.search_gae_lambda);
+        set_if_some!(root_exploration_dirichlet_alpha, file.spo.root_exploration_dirichlet_alpha);
+        set_if_some!(root_exploration_dirichlet_fraction, file.spo.root_exploration_dirichlet_fraction);
+        set_if_some!(resampling_period, file.spo.resampling_period);
+        set_if_some!(resampling_ess_threshold, file.spo.resampling_ess_threshold);
+        set_if_some!(adaptive_temperature, file.spo.adaptive_temperature);
+        set_if_some!(fixed_temperature, file.spo.fixed_temperature);
     }
 
     fn apply_cli_overrides(&mut self, cli: &Self, matches: &ArgMatches) {
@@ -369,6 +503,7 @@ impl Args {
         set_if_cli!(decay_learning_rates, "decay_learning_rates");
         set_if_cli!(standardize_advantages, "standardize_advantages");
         set_if_cli!(reward_scale, "reward_scale");
+        set_if_cli!(tau, "tau");
 
         set_if_cli!(hidden_dim, "hidden_dim");
         set_if_cli!(seed, "seed");
@@ -383,6 +518,24 @@ impl Args {
         set_if_cli!(rank, "rank");
         set_if_cli!(world_size, "world_size");
         set_if_cli!(local_rank, "local_rank");
+
+        set_if_cli!(num_particles, "num_particles");
+        set_if_cli!(search_depth, "search_depth");
+        set_if_cli!(replay_buffer_size, "replay_buffer_size");
+        set_if_cli!(sample_sequence_length, "sample_sequence_length");
+        set_if_cli!(dual_lr, "dual_lr");
+        set_if_cli!(epsilon, "epsilon");
+        set_if_cli!(epsilon_policy, "epsilon_policy");
+        set_if_cli!(init_log_temperature, "init_log_temperature");
+        set_if_cli!(init_log_alpha, "init_log_alpha");
+        set_if_cli!(search_gamma, "search_gamma");
+        set_if_cli!(search_gae_lambda, "search_gae_lambda");
+        set_if_cli!(root_exploration_dirichlet_alpha, "root_exploration_dirichlet_alpha");
+        set_if_cli!(root_exploration_dirichlet_fraction, "root_exploration_dirichlet_fraction");
+        set_if_cli!(resampling_period, "resampling_period");
+        set_if_cli!(resampling_ess_threshold, "resampling_ess_threshold");
+        set_if_cli!(adaptive_temperature, "adaptive_temperature");
+        set_if_cli!(fixed_temperature, "fixed_temperature");
     }
 
     fn provided_on_cli(matches: &ArgMatches, arg_name: &str) -> bool {

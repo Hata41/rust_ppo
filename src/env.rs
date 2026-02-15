@@ -1,6 +1,10 @@
 use anyhow::{bail, Context, Result};
 use crossbeam_channel::{unbounded, Receiver, Sender};
-use std::collections::HashMap;
+use rayon::prelude::*;
+use rustpool::core::mcts::StateRegistry;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::Mutex;
 use std::thread;
 
 use rustpool::core::rl_env::RlEnv;
@@ -17,6 +21,7 @@ pub struct StepOut {
     pub reward: f32,
     pub done: bool,
     pub action_mask: Vec<bool>,
+    pub state_ids: Vec<i32>,
 }
 
 /// Minimal Rust envpool (pure Rust) built on rustpool's worker_loop.
@@ -25,6 +30,9 @@ pub struct AsyncEnvPool {
     num_threads: usize,
     action_txs: Vec<Sender<WorkerAction>>,
     state_rx: Receiver<WorkerMessage>,
+    message_buffer: Mutex<VecDeque<WorkerMessage>>,
+    registry: StateRegistry,
+    live_state_ids: AtomicI64,
     worker_handles: Vec<thread::JoinHandle<()>>,
 }
 
@@ -73,6 +81,9 @@ impl AsyncEnvPool {
             num_threads,
             action_txs,
             state_rx,
+            message_buffer: Mutex::new(VecDeque::new()),
+            registry: StateRegistry::new(),
+            live_state_ids: AtomicI64::new(0),
             worker_handles,
         })
     }
@@ -103,34 +114,75 @@ impl AsyncEnvPool {
                 reward: 0.0,
                 done: false,
                 action_mask: vec![],
+                state_ids: vec![],
             };
             n
         ];
 
         let mut got = 0usize;
         while got < n {
-            match self.state_rx.recv().context("envpool recv failed")? {
-                WorkerMessage::StepResult {
-                    env_id,
-                    obs,
-                    reward,
-                    done,
-                    action_mask,
-                } => {
+            match self.recv_step_message()? {
+                WorkerMessage::StepResult { env_id, obs, reward, done, action_mask } => {
                     if env_id < n {
-                        out[env_id] = StepOut {
-                            obs,
-                            reward,
-                            done,
-                            action_mask,
-                        };
+                        out[env_id] = StepOut { obs, reward, done, action_mask, state_ids: vec![] };
                     }
                     got += 1;
                 }
-                WorkerMessage::SnapshotResult { .. } => {}
+                WorkerMessage::SnapshotResult { .. } => unreachable!("recv_step_message returns only step results"),
             }
         }
         Ok(out)
+    }
+
+    fn recv_step_message(&self) -> Result<WorkerMessage> {
+        {
+            let mut buffer = self.message_buffer.lock().expect("message buffer mutex poisoned");
+            if let Some(idx) = buffer
+                .iter()
+                .position(|msg| matches!(msg, WorkerMessage::StepResult { .. }))
+            {
+                if let Some(msg) = buffer.remove(idx) {
+                    return Ok(msg);
+                }
+            }
+        }
+
+        loop {
+            let msg = self.state_rx.recv().context("envpool recv failed")?;
+            match msg {
+                WorkerMessage::StepResult { .. } => return Ok(msg),
+                WorkerMessage::SnapshotResult { .. } => {
+                    let mut buffer = self.message_buffer.lock().expect("message buffer mutex poisoned");
+                    buffer.push_back(msg);
+                }
+            }
+        }
+    }
+
+    fn recv_snapshot_message(&self, env_ids: &[usize]) -> Result<(usize, Box<dyn RlEnv>)> {
+        {
+            let mut buffer = self.message_buffer.lock().expect("message buffer mutex poisoned");
+            if let Some(idx) = buffer.iter().position(|msg| {
+                matches!(msg, WorkerMessage::SnapshotResult { env_id, .. } if env_ids.contains(env_id))
+            }) {
+                if let Some(WorkerMessage::SnapshotResult { env_id, snapshot }) = buffer.remove(idx) {
+                    return Ok((env_id, snapshot));
+                }
+            }
+        }
+
+        loop {
+            let msg = self.state_rx.recv().context("envpool recv failed")?;
+            match msg {
+                WorkerMessage::SnapshotResult { env_id, snapshot } if env_ids.contains(&env_id) => {
+                    return Ok((env_id, snapshot));
+                }
+                other => {
+                    let mut buffer = self.message_buffer.lock().expect("message buffer mutex poisoned");
+                    buffer.push_back(other);
+                }
+            }
+        }
     }
 
     pub fn reset_all(&self, seed: Option<u64>) -> Result<Vec<StepOut>> {
@@ -151,10 +203,121 @@ impl AsyncEnvPool {
 
         self.recv_n(self.num_envs)
     }
+
+    pub fn snapshot(&self, env_ids: &[usize]) -> Result<Vec<i32>> {
+        if env_ids.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let mut shard_requests: Vec<Vec<usize>> = (0..self.num_threads).map(|_| Vec::new()).collect();
+        for &env_id in env_ids {
+            if env_id >= self.num_envs {
+                bail!("env_id {env_id} out of bounds for num_envs {}", self.num_envs);
+            }
+            let shard_id = env_id % self.num_threads;
+            shard_requests[shard_id].push(env_id);
+        }
+
+        for (shard_id, ids) in shard_requests.into_iter().enumerate() {
+            if !ids.is_empty() {
+                self.action_txs[shard_id]
+                    .send(WorkerAction::Snapshot(ids))
+                    .context("failed to send snapshot request")?;
+            }
+        }
+
+        let mut snapshots = HashMap::new();
+        let mut remaining = env_ids.len();
+        while remaining > 0 {
+            let (env_id, snapshot) = self.recv_snapshot_message(env_ids)?;
+            if snapshots.insert(env_id, snapshot).is_none() {
+                remaining -= 1;
+            }
+        }
+
+        let ordered = env_ids
+            .iter()
+            .map(|env_id| snapshots.remove(env_id).expect("snapshot should exist"))
+            .collect::<Vec<_>>();
+
+        let ids = self.registry.snapshot(ordered);
+        self.live_state_ids
+            .fetch_add(ids.len() as i64, Ordering::Relaxed);
+        Ok(ids)
+    }
+
+    pub fn simulate_batch(&self, state_ids: &[i32], actions: &[i32]) -> Result<Vec<StepOut>> {
+        if state_ids.len() != actions.len() {
+            bail!("state_ids length ({}) must match actions length ({})", state_ids.len(), actions.len());
+        }
+        if state_ids.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let envs = self.registry.get_clones(state_ids).map_err(anyhow::Error::msg)?;
+        let rollouts = envs
+            .into_par_iter()
+            .zip(actions.par_iter().copied())
+            .map(|(mut env, action)| {
+                let (obs, reward, done, action_mask) = env.step(action);
+                (env, obs, reward, done, action_mask)
+            })
+            .collect::<Vec<_>>();
+
+        let mut next_envs = Vec::with_capacity(rollouts.len());
+        let mut out = Vec::with_capacity(rollouts.len());
+        for (env, obs, reward, done, action_mask) in rollouts {
+            next_envs.push(env);
+            out.push(StepOut {
+                obs,
+                reward,
+                done,
+                action_mask,
+                state_ids: vec![],
+            });
+        }
+
+        let new_state_ids = self.registry.snapshot(next_envs);
+        self.live_state_ids
+            .fetch_add(new_state_ids.len() as i64, Ordering::Relaxed);
+        for (step, sid) in out.iter_mut().zip(new_state_ids.into_iter()) {
+            step.state_ids.push(sid);
+        }
+
+        Ok(out)
+    }
+
+    pub fn release_batch(&self, state_ids: &[i32]) {
+        self.registry.release(state_ids);
+        if !state_ids.is_empty() {
+            let unique = state_ids.iter().copied().collect::<HashSet<_>>().len() as i64;
+            self.live_state_ids
+                .fetch_sub(unique, Ordering::Relaxed);
+        }
+
+        #[cfg(debug_assertions)]
+        {
+            let live = self.live_state_ids.load(Ordering::Relaxed);
+            debug_assert!(
+                live >= 0,
+                "release_batch underflow detected: live state counter is {}",
+                live
+            );
+        }
+    }
 }
 
 impl Drop for AsyncEnvPool {
     fn drop(&mut self) {
+        let live = self.live_state_ids.load(Ordering::Relaxed);
+        if live != 0 {
+            let cleared = self.registry.clear() as i64;
+            if cleared > 0 {
+                self.live_state_ids.fetch_sub(cleared, Ordering::Relaxed);
+            }
+            self.live_state_ids.store(0, Ordering::Relaxed);
+        }
+
         for tx in &self.action_txs {
             let _ = tx.send(WorkerAction::Close);
         }
