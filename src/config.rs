@@ -371,7 +371,8 @@ impl Args {
         let mut directives = vec![self.log_level.trim().to_string()];
 
         if !self.backend_logs_visible {
-            directives.push("cubecl_cuda::compute::context=off".to_string());
+            directives.push("cubecl_cuda=off".to_string());
+            directives.push("cubecl_runtime=off".to_string());
         }
 
         directives.join(",")

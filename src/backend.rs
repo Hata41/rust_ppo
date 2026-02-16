@@ -1,11 +1,9 @@
 use std::any::Any;
 use std::ffi::{CStr, CString};
-use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
 use burn::backend::cuda::CudaDevice;
 use cudarc::driver::{CudaContext, DriverError};
-use cudarc::nvrtc::CompileError;
 use tracing::warn;
 
 use crate::config::{Args, DeviceType};
@@ -296,55 +294,6 @@ fn classify_driver_error(err: DriverError, cuda_device: usize) -> CudaProbeFailu
     }
 }
 
-fn classify_nvrtc_panic(message: String) -> CudaProbeFailure {
-    let lowered = message.to_lowercase();
-    if lowered.contains("nvrtc") {
-        if toolkit_root_exists() {
-            return CudaProbeFailure {
-                kind: CudaProbeFailureKind::MissingNvrtc,
-                detail: format!(
-                    "NVRTC failed to load despite toolkit hints present ({message}); check LD_LIBRARY_PATH and toolkit installation"
-                ),
-            };
-        }
-
-        return CudaProbeFailure {
-            kind: CudaProbeFailureKind::DriverOnlyNoToolkit,
-            detail: format!(
-                "CUDA driver appears available, but toolkit/NVRTC is missing ({message})"
-            ),
-        };
-    }
-
-    CudaProbeFailure {
-        kind: CudaProbeFailureKind::InitFailure,
-        detail: format!("NVRTC probe panicked: {message}"),
-    }
-}
-
-fn classify_nvrtc_error(err: CompileError) -> CudaProbeFailure {
-    let detail = format!("{err:?}");
-    let lowered = detail.to_lowercase();
-
-    let kind = if lowered.contains("unsupported")
-        || lowered.contains("invalid ptx")
-        || lowered.contains("invalid value for --gpu-architecture")
-        || lowered.contains("-arch")
-    {
-        CudaProbeFailureKind::UnsupportedCudaVersion
-    } else if lowered.contains("nvrtc") && lowered.contains("not found") {
-        if toolkit_root_exists() {
-            CudaProbeFailureKind::MissingNvrtc
-        } else {
-            CudaProbeFailureKind::DriverOnlyNoToolkit
-        }
-    } else {
-        CudaProbeFailureKind::InitFailure
-    };
-
-    CudaProbeFailure { kind, detail }
-}
-
 fn classify_burn_cuda_panic(message: String) -> CudaProbeFailure {
     let lowered = message.to_lowercase();
     if lowered.contains("undefined symbol") {
@@ -369,18 +318,6 @@ fn classify_burn_cuda_panic(message: String) -> CudaProbeFailure {
         kind: CudaProbeFailureKind::InitFailure,
         detail: format!("Burn CUDA backend initialization panicked: {message}"),
     }
-}
-
-fn toolkit_root_exists() -> bool {
-    std::env::var("CUDA_PATH")
-        .ok()
-        .filter(|p| Path::new(p).exists())
-        .is_some()
-        || std::env::var("CUDA_HOME")
-            .ok()
-            .filter(|p| Path::new(p).exists())
-            .is_some()
-        || Path::new("/usr/local/cuda").exists()
 }
 
 fn failure_kind_label(kind: CudaProbeFailureKind) -> &'static str {

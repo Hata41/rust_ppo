@@ -12,7 +12,7 @@ environment:
   # rustpool task id (examples: "BinPack-v0", "Maze-v0")
   task_id: "BinPack-v0"
   # Number of parallel training environments
-  num_envs: 64
+  num_envs: 256
   # BinPack-specific max number of items in an instance
   max_items: 20
   # BinPack-specific max number of EMS entries
@@ -24,7 +24,7 @@ training_core:
   # Trajectory horizon T per environment per PPO update
   rollout_length: 20
   # Total PPO updates
-  num_updates: 2
+  num_updates: 200
   # PPO epochs over each collected rollout buffer
   epochs: 1
   # Number of minibatches per epoch
