@@ -39,4 +39,4 @@ burn-ndarray = "=0.20.1"
 cudarc = { version = "=0.18.2", default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-13000"] }
 
 [patch.crates-io]
-cubecl-cuda = { path = "vendor/cubecl-cuda-0.9.0" }
+cubecl-cuda = { path = "../cubecl/crates/cubecl-cuda" }
