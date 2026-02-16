@@ -40,6 +40,82 @@ fn linear_decay_alpha(update: usize, num_updates: usize) -> f64 {
     1.0 - progress
 }
 
+struct GradSqAccumulator<'a> {
+    grads: &'a GradientsParams,
+    sum_sq: f64,
+}
+
+impl<'a> GradSqAccumulator<'a> {
+    fn new(grads: &'a GradientsParams) -> Self {
+        Self { grads, sum_sq: 0.0 }
+    }
+}
+
+impl<Bk: AutodiffBackend> ModuleVisitor<Bk> for GradSqAccumulator<'_> {
+    fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<Bk, D>>) {
+        let id = param.id;
+        if let Some(grad) = self.grads.get::<Bk::InnerBackend, D>(id) {
+            if let Ok(values) = grad.to_data().to_vec::<f32>() {
+                self.sum_sq += values
+                    .iter()
+                    .map(|v| {
+                        let x: f64 = (*v).into();
+                        x * x
+                    })
+                    .sum::<f64>();
+            }
+        }
+    }
+}
+
+struct GradScaler<'a> {
+    grads: &'a mut GradientsParams,
+    scale: f64,
+}
+
+impl<Bk: AutodiffBackend> ModuleVisitor<Bk> for GradScaler<'_> {
+    fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<Bk, D>>) {
+        let id = param.id;
+        if let Some(grad) = self.grads.remove::<Bk::InnerBackend, D>(id) {
+            self.grads
+                .register::<Bk::InnerBackend, D>(id, grad.mul_scalar(self.scale));
+        }
+    }
+}
+
+fn clip_global_grad_norm<Bk: AutodiffBackend>(
+    actor: &crate::models::Actor<Bk>,
+    critic: &crate::models::Critic<Bk>,
+    grads_actor: &mut GradientsParams,
+    grads_critic: &mut GradientsParams,
+    max_grad_norm: f32,
+) -> f32 {
+    let mut actor_acc = GradSqAccumulator::new(grads_actor);
+    <crate::models::Actor<Bk> as Module<Bk>>::visit(actor, &mut actor_acc);
+
+    let mut critic_acc = GradSqAccumulator::new(grads_critic);
+    <crate::models::Critic<Bk> as Module<Bk>>::visit(critic, &mut critic_acc);
+
+    let total_norm = (actor_acc.sum_sq + critic_acc.sum_sq).sqrt() as f32;
+    if max_grad_norm > 0.0 && total_norm > max_grad_norm {
+        let scale = (max_grad_norm / (total_norm + 1.0e-6)) as f64;
+
+        let mut actor_scaler = GradScaler {
+            grads: grads_actor,
+            scale,
+        };
+        <crate::models::Actor<Bk> as Module<Bk>>::visit(actor, &mut actor_scaler);
+
+        let mut critic_scaler = GradScaler {
+            grads: grads_critic,
+            scale,
+        };
+        <crate::models::Critic<Bk> as Module<Bk>>::visit(critic, &mut critic_scaler);
+    }
+
+    total_norm
+}
+
 fn greedy_actions_from_weights(
     root_action_weights: &[f32],
     batch: usize,
@@ -424,6 +500,7 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
         let mut temp_loss_acc = Tensor::<B, 1>::zeros([1], &device);
         let mut alpha_loss_acc = Tensor::<B, 1>::zeros([1], &device);
         let mut mpo_total_loss_acc = Tensor::<B, 1>::zeros([1], &device);
+        let mut grad_norm_sum = 0.0f64;
         let mut optimization_updates = 0usize;
         let mut sample_duration_ms = 0.0f64;
         let mut model_forward_loss_duration_ms = 0.0f64;
@@ -535,16 +612,26 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                     let backward_started = Instant::now();
                     let mut grads = parts.total_loss.backward();
 
-                    let grads_actor = GradientsParams::from_module::<B, crate::models::Actor<B>>(
+                    let mut grads_actor =
+                        GradientsParams::from_module::<B, crate::models::Actor<B>>(
                         &mut grads,
                         &agent_online.actor,
                     );
-                    let grads_critic = GradientsParams::from_module::<B, crate::models::Critic<B>>(
+                    let mut grads_critic =
+                        GradientsParams::from_module::<B, crate::models::Critic<B>>(
                         &mut grads,
                         &agent_online.critic,
                     );
                     let grads_duals =
                         GradientsParams::from_module::<B, MpoDuals<B>>(&mut grads, &duals);
+
+                    let global_grad_norm = clip_global_grad_norm(
+                        &agent_online.actor,
+                        &agent_online.critic,
+                        &mut grads_actor,
+                        &mut grads_critic,
+                        args.max_grad_norm,
+                    );
 
                     agent_online.actor =
                         actor_optim.step(current_actor_lr, agent_online.actor, grads_actor);
@@ -560,6 +647,7 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                     temp_loss_acc = temp_loss_acc + parts.loss_temperature.detach();
                     alpha_loss_acc = alpha_loss_acc + parts.loss_alpha.detach();
                     mpo_total_loss_acc = mpo_total_loss_acc + parts.total_loss.detach();
+                    grad_norm_sum += global_grad_norm as f64;
                     optimization_updates += 1;
                 }
             }
@@ -604,6 +692,7 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
             let mean_temp_loss = temp_loss_sum / denom;
             let mean_alpha_loss = alpha_loss_sum / denom;
             let mean_mpo_total_loss = mpo_total_loss_sum / denom;
+            let mean_global_grad_norm = grad_norm_sum / denom;
 
             let mean_return = if recent_returns.is_empty() {
                 0.0
@@ -645,7 +734,7 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                 actor_loss = mean_actor_loss,
                 critic_loss = mean_critic_loss,
                 entropy = 0.0,
-                global_grad_norm = 0.0,
+                global_grad_norm = mean_global_grad_norm,
                 mpo_temperature_loss = mean_temp_loss,
                 mpo_alpha_loss = mean_alpha_loss,
                 mpo_total_loss = mean_mpo_total_loss,

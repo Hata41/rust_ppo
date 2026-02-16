@@ -24,11 +24,11 @@ training_core:
   # Trajectory horizon T per environment per PPO update
   rollout_length: 20
   # Total PPO updates
-  num_updates: 200
+  num_updates: 1000
   # PPO epochs over each collected rollout buffer
   epochs: 1
   # Number of minibatches per epoch
-  num_minibatches: 1
+  num_minibatches: 16
   # Reward discount factor
   gamma: 0.99
   # GAE lambda
@@ -62,11 +62,11 @@ architecture:
 
 evaluation:
   # Run deterministic evaluation every N updates
-  eval_interval: 1
+  eval_interval: 10
   # Number of parallel environments used during evaluation
-  num_eval_envs: 50
+  num_eval_envs: 256
   # Number of completed episodes to aggregate per eval phase
-  num_eval_episodes: 50
+  num_eval_episodes: 256
 
 hardware:
   # "cuda" or "cpu"

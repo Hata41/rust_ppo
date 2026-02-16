@@ -4,39 +4,39 @@ use burn::nn::{Linear, LinearConfig};
 use burn::tensor::backend::Backend;
 use burn::tensor::{Bool, Tensor};
 
-#[derive(Module, Clone, Debug)]
-pub struct Mlp<Bk: burn::tensor::backend::Backend> {
-    l1: Linear<Bk>,
-    l2: Linear<Bk>,
+#[derive(Module, Debug)]
+pub struct Mlp<B: burn::tensor::backend::Backend> {
+    l1: Linear<B>,
+    l2: Linear<B>,
 }
 
-impl<Bk: burn::tensor::backend::Backend> Mlp<Bk> {
-    pub fn new(in_dim: usize, hidden: usize, device: &Bk::Device) -> Self {
+impl<B: burn::tensor::backend::Backend> Mlp<B> {
+    pub fn new(in_dim: usize, hidden: usize, device: &B::Device) -> Self {
         let l1 = LinearConfig::new(in_dim, hidden).init(device);
         let l2 = LinearConfig::new(hidden, hidden).init(device);
         Self { l1, l2 }
     }
 
-    pub fn forward(&self, x: Tensor<Bk, 2>) -> Tensor<Bk, 2> {
+    pub fn forward(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
         let x = burn::tensor::activation::relu(self.l1.forward(x));
         burn::tensor::activation::relu(self.l2.forward(x))
     }
 }
 
-#[derive(Module, Clone, Debug)]
-pub struct TransformerBlock<Bk: burn::tensor::backend::Backend> {
-    ems_self_attn: MultiHeadAttention<Bk>,
-    item_self_attn: MultiHeadAttention<Bk>,
-    ems_to_item_attn: MultiHeadAttention<Bk>,
-    item_to_ems_attn: MultiHeadAttention<Bk>,
-    ems_ff1: Linear<Bk>,
-    ems_ff2: Linear<Bk>,
-    item_ff1: Linear<Bk>,
-    item_ff2: Linear<Bk>,
+#[derive(Module, Debug)]
+pub struct TransformerBlock<B: burn::tensor::backend::Backend> {
+    ems_self_attn: MultiHeadAttention<B>,
+    item_self_attn: MultiHeadAttention<B>,
+    ems_to_item_attn: MultiHeadAttention<B>,
+    item_to_ems_attn: MultiHeadAttention<B>,
+    ems_ff1: Linear<B>,
+    ems_ff2: Linear<B>,
+    item_ff1: Linear<B>,
+    item_ff2: Linear<B>,
 }
 
-impl<Bk: burn::tensor::backend::Backend> TransformerBlock<Bk> {
-    pub fn new(embed_dim: usize, num_heads: usize, dropout: f64, device: &Bk::Device) -> Self {
+impl<B: burn::tensor::backend::Backend> TransformerBlock<B> {
+    pub fn new(embed_dim: usize, num_heads: usize, dropout: f64, device: &B::Device) -> Self {
         let ems_self_attn = MultiHeadAttentionConfig::new(embed_dim, num_heads)
             .with_dropout(dropout)
             .init(device);
@@ -71,11 +71,11 @@ impl<Bk: burn::tensor::backend::Backend> TransformerBlock<Bk> {
 
     pub fn forward(
         &self,
-        ems: Tensor<Bk, 3>,
-        items: Tensor<Bk, 3>,
-        ems_pad_mask: Tensor<Bk, 2, Bool>,
-        items_pad_mask: Tensor<Bk, 2, Bool>,
-    ) -> (Tensor<Bk, 3>, Tensor<Bk, 3>) {
+        ems: Tensor<B, 3>,
+        items: Tensor<B, 3>,
+        ems_pad_mask: Tensor<B, 2, Bool>,
+        items_pad_mask: Tensor<B, 2, Bool>,
+    ) -> (Tensor<B, 3>, Tensor<B, 3>) {
         let ems_self = self
             .ems_self_attn
             .forward(MhaInput::self_attn(ems.clone()).mask_pad(ems_pad_mask.clone()))
@@ -113,20 +113,20 @@ impl<Bk: burn::tensor::backend::Backend> TransformerBlock<Bk> {
     }
 }
 
-#[derive(Module, Clone, Debug)]
-pub struct BinPackTorso<Bk: burn::tensor::backend::Backend> {
-    ems_encoder: Linear<Bk>,
-    item_encoder: Linear<Bk>,
-    blocks: Vec<TransformerBlock<Bk>>,
+#[derive(Module, Debug)]
+pub struct BinPackTorso<B: burn::tensor::backend::Backend> {
+    ems_encoder: Linear<B>,
+    item_encoder: Linear<B>,
+    blocks: Vec<TransformerBlock<B>>,
 }
 
-impl<Bk: burn::tensor::backend::Backend> BinPackTorso<Bk> {
+impl<B: burn::tensor::backend::Backend> BinPackTorso<B> {
     pub fn new(
         embed_dim: usize,
         num_layers: usize,
         num_heads: usize,
         dropout: f64,
-        device: &Bk::Device,
+        device: &B::Device,
     ) -> Self {
         let ems_encoder = LinearConfig::new(6, embed_dim).init(device);
         let item_encoder = LinearConfig::new(3, embed_dim).init(device);
@@ -143,11 +143,11 @@ impl<Bk: burn::tensor::backend::Backend> BinPackTorso<Bk> {
 
     pub fn forward(
         &self,
-        ems: Tensor<Bk, 3>,
-        items: Tensor<Bk, 3>,
-        ems_pad_mask: Tensor<Bk, 2, Bool>,
-        items_pad_mask: Tensor<Bk, 2, Bool>,
-    ) -> (Tensor<Bk, 3>, Tensor<Bk, 3>) {
+        ems: Tensor<B, 3>,
+        items: Tensor<B, 3>,
+        ems_pad_mask: Tensor<B, 2, Bool>,
+        items_pad_mask: Tensor<B, 2, Bool>,
+    ) -> (Tensor<B, 3>, Tensor<B, 3>) {
         let mut ems_h = self.ems_encoder.forward(ems);
         let mut item_h = self.item_encoder.forward(items);
 
@@ -162,15 +162,15 @@ impl<Bk: burn::tensor::backend::Backend> BinPackTorso<Bk> {
     }
 }
 
-#[derive(Module, Clone, Debug)]
-pub struct BinPackActor<Bk: burn::tensor::backend::Backend> {
-    torso: BinPackTorso<Bk>,
-    ems_proj: Linear<Bk>,
-    item_proj: Linear<Bk>,
+#[derive(Module, Debug)]
+pub struct BinPackActor<B: burn::tensor::backend::Backend> {
+    torso: BinPackTorso<B>,
+    ems_proj: Linear<B>,
+    item_proj: Linear<B>,
 }
 
-impl<Bk: burn::tensor::backend::Backend> BinPackActor<Bk> {
-    pub fn new(hidden: usize, device: &Bk::Device) -> Self {
+impl<B: burn::tensor::backend::Backend> BinPackActor<B> {
+    pub fn new(hidden: usize, device: &B::Device) -> Self {
         let torso = BinPackTorso::new(hidden, 2, 4, 0.0, device);
         let ems_proj = LinearConfig::new(hidden, hidden).init(device);
         let item_proj = LinearConfig::new(hidden, hidden).init(device);
@@ -183,11 +183,11 @@ impl<Bk: burn::tensor::backend::Backend> BinPackActor<Bk> {
 
     pub fn forward(
         &self,
-        ems: Tensor<Bk, 3>,
-        items: Tensor<Bk, 3>,
-        ems_pad_mask: Tensor<Bk, 2, Bool>,
-        items_pad_mask: Tensor<Bk, 2, Bool>,
-    ) -> Tensor<Bk, 2> {
+        ems: Tensor<B, 3>,
+        items: Tensor<B, 3>,
+        ems_pad_mask: Tensor<B, 2, Bool>,
+        items_pad_mask: Tensor<B, 2, Bool>,
+    ) -> Tensor<B, 2> {
         let (ems_h, item_h) = self.torso.forward(ems, items, ems_pad_mask, items_pad_mask);
         let ems_h = self.ems_proj.forward(ems_h);
         let item_h = self.item_proj.forward(item_h);
@@ -198,15 +198,15 @@ impl<Bk: burn::tensor::backend::Backend> BinPackActor<Bk> {
     }
 }
 
-#[derive(Module, Clone, Debug)]
-pub struct BinPackCritic<Bk: burn::tensor::backend::Backend> {
-    torso: BinPackTorso<Bk>,
-    value_mlp: Mlp<Bk>,
-    value_head: Linear<Bk>,
+#[derive(Module, Debug)]
+pub struct BinPackCritic<B: burn::tensor::backend::Backend> {
+    torso: BinPackTorso<B>,
+    value_mlp: Mlp<B>,
+    value_head: Linear<B>,
 }
 
-impl<Bk: burn::tensor::backend::Backend> BinPackCritic<Bk> {
-    pub fn new(hidden: usize, device: &Bk::Device) -> Self {
+impl<B: burn::tensor::backend::Backend> BinPackCritic<B> {
+    pub fn new(hidden: usize, device: &B::Device) -> Self {
         let torso = BinPackTorso::new(hidden, 2, 4, 0.0, device);
         let value_mlp = Mlp::new(hidden * 2, hidden, device);
         let value_head = LinearConfig::new(hidden, 1).init(device);
@@ -219,13 +219,13 @@ impl<Bk: burn::tensor::backend::Backend> BinPackCritic<Bk> {
 
     pub fn forward(
         &self,
-        ems: Tensor<Bk, 3>,
-        items: Tensor<Bk, 3>,
-        ems_pad_mask: Tensor<Bk, 2, Bool>,
-        items_pad_mask: Tensor<Bk, 2, Bool>,
-        ems_valid_f32: Tensor<Bk, 2>,
-        items_valid_f32: Tensor<Bk, 2>,
-    ) -> Tensor<Bk, 2> {
+        ems: Tensor<B, 3>,
+        items: Tensor<B, 3>,
+        ems_pad_mask: Tensor<B, 2, Bool>,
+        items_pad_mask: Tensor<B, 2, Bool>,
+        ems_valid_f32: Tensor<B, 2>,
+        items_valid_f32: Tensor<B, 2>,
+    ) -> Tensor<B, 2> {
         let (ems_h, item_h) = self.torso.forward(ems, items, ems_pad_mask, items_pad_mask);
 
         let [batch, ems_len, hidden] = ems_h.dims();
@@ -242,15 +242,15 @@ impl<Bk: burn::tensor::backend::Backend> BinPackCritic<Bk> {
     }
 }
 
-#[derive(Module, Clone, Debug)]
-pub struct Actor<Bk: burn::tensor::backend::Backend> {
-    torso: Mlp<Bk>,
-    head: Linear<Bk>,
-    binpack: BinPackActor<Bk>,
+#[derive(Module, Debug)]
+pub struct Actor<B: burn::tensor::backend::Backend> {
+    torso: Mlp<B>,
+    head: Linear<B>,
+    binpack: BinPackActor<B>,
 }
 
-impl<Bk: burn::tensor::backend::Backend> Actor<Bk> {
-    pub fn new(obs_dim: usize, hidden: usize, action_dim: usize, device: &Bk::Device) -> Self {
+impl<B: burn::tensor::backend::Backend> Actor<B> {
+    pub fn new(obs_dim: usize, hidden: usize, action_dim: usize, device: &B::Device) -> Self {
         let torso = Mlp::new(obs_dim, hidden, device);
         let head = LinearConfig::new(hidden, action_dim).init(device);
         let binpack = BinPackActor::new(hidden, device);
@@ -261,23 +261,23 @@ impl<Bk: burn::tensor::backend::Backend> Actor<Bk> {
         }
     }
 
-    pub fn forward(&self, obs: Tensor<Bk, 2>) -> Tensor<Bk, 2> {
+    pub fn forward(&self, obs: Tensor<B, 2>) -> Tensor<B, 2> {
         let h = self.torso.forward(obs);
         self.head.forward(h)
     }
 
     pub fn forward_binpack(
         &self,
-        ems: Tensor<Bk, 3>,
-        items: Tensor<Bk, 3>,
-        ems_pad_mask: Tensor<Bk, 2, Bool>,
-        items_pad_mask: Tensor<Bk, 2, Bool>,
-    ) -> Tensor<Bk, 2> {
+        ems: Tensor<B, 3>,
+        items: Tensor<B, 3>,
+        ems_pad_mask: Tensor<B, 2, Bool>,
+        items_pad_mask: Tensor<B, 2, Bool>,
+    ) -> Tensor<B, 2> {
         self.binpack
             .forward(ems, items, ems_pad_mask, items_pad_mask)
     }
 
-    pub fn forward_input(&self, input: ActorInput<Bk>) -> Tensor<Bk, 2> {
+    pub fn forward_input(&self, input: ActorInput<B>) -> Tensor<B, 2> {
         match input {
             ActorInput::Dense { obs } => self.forward(obs),
             ActorInput::BinPack {
@@ -290,15 +290,15 @@ impl<Bk: burn::tensor::backend::Backend> Actor<Bk> {
     }
 }
 
-#[derive(Module, Clone, Debug)]
-pub struct Critic<Bk: burn::tensor::backend::Backend> {
-    torso: Mlp<Bk>,
-    head: Linear<Bk>,
-    binpack: BinPackCritic<Bk>,
+#[derive(Module, Debug)]
+pub struct Critic<B: burn::tensor::backend::Backend> {
+    torso: Mlp<B>,
+    head: Linear<B>,
+    binpack: BinPackCritic<B>,
 }
 
-impl<Bk: burn::tensor::backend::Backend> Critic<Bk> {
-    pub fn new(obs_dim: usize, hidden: usize, device: &Bk::Device) -> Self {
+impl<B: burn::tensor::backend::Backend> Critic<B> {
+    pub fn new(obs_dim: usize, hidden: usize, device: &B::Device) -> Self {
         let torso = Mlp::new(obs_dim, hidden, device);
         let head = LinearConfig::new(hidden, 1).init(device);
         let binpack = BinPackCritic::new(hidden, device);
@@ -309,20 +309,20 @@ impl<Bk: burn::tensor::backend::Backend> Critic<Bk> {
         }
     }
 
-    pub fn forward(&self, obs: Tensor<Bk, 2>) -> Tensor<Bk, 2> {
+    pub fn forward(&self, obs: Tensor<B, 2>) -> Tensor<B, 2> {
         let h = self.torso.forward(obs);
         self.head.forward(h)
     }
 
     pub fn forward_binpack(
         &self,
-        ems: Tensor<Bk, 3>,
-        items: Tensor<Bk, 3>,
-        ems_pad_mask: Tensor<Bk, 2, Bool>,
-        items_pad_mask: Tensor<Bk, 2, Bool>,
-        ems_valid_f32: Tensor<Bk, 2>,
-        items_valid_f32: Tensor<Bk, 2>,
-    ) -> Tensor<Bk, 2> {
+        ems: Tensor<B, 3>,
+        items: Tensor<B, 3>,
+        ems_pad_mask: Tensor<B, 2, Bool>,
+        items_pad_mask: Tensor<B, 2, Bool>,
+        ems_valid_f32: Tensor<B, 2>,
+        items_valid_f32: Tensor<B, 2>,
+    ) -> Tensor<B, 2> {
         self.binpack.forward(
             ems,
             items,
@@ -333,7 +333,7 @@ impl<Bk: burn::tensor::backend::Backend> Critic<Bk> {
         )
     }
 
-    pub fn forward_input(&self, input: CriticInput<Bk>) -> Tensor<Bk, 2> {
+    pub fn forward_input(&self, input: CriticInput<B>) -> Tensor<B, 2> {
         match input {
             CriticInput::Dense { obs } => self.forward(obs),
             CriticInput::BinPack {
@@ -355,61 +355,61 @@ impl<Bk: burn::tensor::backend::Backend> Critic<Bk> {
     }
 }
 
-pub enum ActorInput<Bk: Backend> {
+pub enum ActorInput<B: Backend> {
     Dense {
-        obs: Tensor<Bk, 2>,
+        obs: Tensor<B, 2>,
     },
     BinPack {
-        ems: Tensor<Bk, 3>,
-        items: Tensor<Bk, 3>,
-        ems_pad_mask: Tensor<Bk, 2, Bool>,
-        items_pad_mask: Tensor<Bk, 2, Bool>,
+        ems: Tensor<B, 3>,
+        items: Tensor<B, 3>,
+        ems_pad_mask: Tensor<B, 2, Bool>,
+        items_pad_mask: Tensor<B, 2, Bool>,
     },
 }
 
-pub enum CriticInput<Bk: Backend> {
+pub enum CriticInput<B: Backend> {
     Dense {
-        obs: Tensor<Bk, 2>,
+        obs: Tensor<B, 2>,
     },
     BinPack {
-        ems: Tensor<Bk, 3>,
-        items: Tensor<Bk, 3>,
-        ems_pad_mask: Tensor<Bk, 2, Bool>,
-        items_pad_mask: Tensor<Bk, 2, Bool>,
-        ems_valid_f32: Tensor<Bk, 2>,
-        items_valid_f32: Tensor<Bk, 2>,
+        ems: Tensor<B, 3>,
+        items: Tensor<B, 3>,
+        ems_pad_mask: Tensor<B, 2, Bool>,
+        items_pad_mask: Tensor<B, 2, Bool>,
+        ems_valid_f32: Tensor<B, 2>,
+        items_valid_f32: Tensor<B, 2>,
     },
 }
 
-pub enum PolicyInput<Bk: Backend> {
+pub enum PolicyInput<B: Backend> {
     Dense {
-        obs: Tensor<Bk, 2>,
+        obs: Tensor<B, 2>,
     },
     BinPack {
-        ems: Tensor<Bk, 3>,
-        items: Tensor<Bk, 3>,
-        ems_pad_mask: Tensor<Bk, 2, Bool>,
-        items_pad_mask: Tensor<Bk, 2, Bool>,
-        ems_valid_f32: Tensor<Bk, 2>,
-        items_valid_f32: Tensor<Bk, 2>,
+        ems: Tensor<B, 3>,
+        items: Tensor<B, 3>,
+        ems_pad_mask: Tensor<B, 2, Bool>,
+        items_pad_mask: Tensor<B, 2, Bool>,
+        ems_valid_f32: Tensor<B, 2>,
+        items_valid_f32: Tensor<B, 2>,
     },
 }
 
-#[derive(Module, Clone, Debug)]
-pub struct Agent<Bk: burn::tensor::backend::Backend> {
-    pub actor: Actor<Bk>,
-    pub critic: Critic<Bk>,
+#[derive(Module, Debug)]
+pub struct Agent<B: burn::tensor::backend::Backend> {
+    pub actor: Actor<B>,
+    pub critic: Critic<B>,
 }
 
-impl<Bk: burn::tensor::backend::Backend> Agent<Bk> {
-    pub fn new(obs_dim: usize, hidden: usize, action_dim: usize, device: &Bk::Device) -> Self {
+impl<B: burn::tensor::backend::Backend> Agent<B> {
+    pub fn new(obs_dim: usize, hidden: usize, action_dim: usize, device: &B::Device) -> Self {
         Self {
             actor: Actor::new(obs_dim, hidden, action_dim, device),
             critic: Critic::new(obs_dim, hidden, device),
         }
     }
 
-    pub fn policy_value(&self, input: PolicyInput<Bk>) -> (Tensor<Bk, 2>, Tensor<Bk, 2>) {
+    pub fn policy_value(&self, input: PolicyInput<B>) -> (Tensor<B, 2>, Tensor<B, 2>) {
         match input {
             PolicyInput::Dense { obs } => {
                 let logits = self
@@ -445,11 +445,11 @@ impl<Bk: burn::tensor::backend::Backend> Agent<Bk> {
         }
     }
 
-    pub fn actor_logits(&self, input: ActorInput<Bk>) -> Tensor<Bk, 2> {
+    pub fn actor_logits(&self, input: ActorInput<B>) -> Tensor<B, 2> {
         self.actor.forward_input(input)
     }
 
-    pub fn critic_values(&self, input: CriticInput<Bk>) -> Tensor<Bk, 2> {
+    pub fn critic_values(&self, input: CriticInput<B>) -> Tensor<B, 2> {
         self.critic.forward_input(input)
     }
 }

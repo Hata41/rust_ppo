@@ -24,11 +24,23 @@ impl DashboardVisitor {
         }
         self.fields.push((name.to_string(), value));
     }
+
+    fn format_float(value: f64) -> String {
+        let abs = value.abs();
+        if value == 0.0 {
+            return "0".to_string();
+        }
+        if (1.0e-3..1.0e4).contains(&abs) {
+            format!("{value:.6}")
+        } else {
+            format!("{value:.6e}")
+        }
+    }
 }
 
 impl Visit for DashboardVisitor {
     fn record_f64(&mut self, field: &Field, value: f64) {
-        self.record_value(field, format!("{value:.3}"));
+        self.record_value(field, Self::format_float(value));
     }
 
     fn record_i64(&mut self, field: &Field, value: i64) {

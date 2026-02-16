@@ -46,7 +46,7 @@ impl<Bk: AutodiffBackend> ModuleVisitor<Bk> for GradSqAccumulator<'_> {
     fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<Bk, D>>) {
         let id = param.id;
         if let Some(grad) = self.grads.get::<Bk::InnerBackend, D>(id) {
-            if let Ok(values) = grad.to_data().to_vec::<Bk::FloatElem>() {
+            if let Ok(values) = grad.to_data().to_vec::<f32>() {
                 self.sum_sq += values
                     .iter()
                     .map(|v| {
