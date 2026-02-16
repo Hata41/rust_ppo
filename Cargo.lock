@@ -1545,6 +1545,7 @@ dependencies = [
 [[package]]
 name = "cubecl-cuda"
 version = "0.9.0"
+source = "git+https://github.com/Hata41/cubecl.git?rev=2cef73c4157db7adb88892f862c85ae04dc3956a#2cef73c4157db7adb88892f862c85ae04dc3956a"
 dependencies = [
  "bytemuck",
  "cubecl-common",
