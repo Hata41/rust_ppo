@@ -1,6 +1,13 @@
 # Telemetry
 
-This project uses one shared dashboard formatting stack for PPO and SPO:
+This project uses a dual telemetry pipeline for PPO and SPO:
+
+- **Tracing (OTLP):** exports spans/events to MLflow OTLP (`/v1/traces`) for execution timelines.
+- **Metrics (REST):** exports scalar metrics to MLflow REST (`/api/2.0/mlflow/runs/log-batch`) for line charts.
+
+Both pipelines are active in parallel from the same `tracing` events.
+
+Shared modules:
 
 - formatter and category rendering: [src/telemetry.rs](../src/telemetry.rs)
 - PPO wiring: [src/bin/ppo.rs](../src/bin/ppo.rs)
@@ -16,6 +23,65 @@ Structured metrics are emitted under these categories:
 - `MISC`
 
 Category names are normalized by formatter-level mapping.
+
+## MLflow metrics key mapping
+
+Metrics are automatically prefixed from the `category` field before being sent to MLflow:
+
+- `TRAINER` / `TRAIN` → `trainer/`
+- `ACTOR` / `ACT` → `actor/`
+- `EVALUATOR` / `EVAL` → `evaluator/`
+- default → `misc/`
+
+Example:
+
+- `tracing::info!(category="TRAINER", critic_loss=0.5, timesteps=100, "train")`
+- exported metric key: `trainer/critic_loss` (step `100`)
+
+Notes:
+
+- only numeric fields are exported as metrics,
+- `category`, `message`, `telemetry` are never exported as metric keys,
+- events without an explicit step field are skipped by the metrics exporter.
+
+Accepted step fields:
+
+- `timesteps`
+- `policy_version`
+- `step`
+- `global_step`
+- `update`
+
+## Non-blocking metrics architecture
+
+Metrics export never performs HTTP inside `on_event`:
+
+- `MlflowMetricsLayer` extracts numeric fields synchronously.
+- Metrics are pushed into a `crossbeam_channel`.
+- A background worker batches and POSTs to MLflow REST.
+
+Batching behavior:
+
+- flush every ~1 second, or
+- flush when batch size reaches 50.
+
+Reliability behavior:
+
+- retry transient failures up to 3 attempts,
+- request timeout is short (3s),
+- warning logs are rate-limited.
+
+## Run ID behavior (metrics)
+
+Metrics require an MLflow `run_id`.
+
+- if `--mlflow-run-id` is provided, it is used,
+- otherwise the binary attempts `runs/create` automatically,
+- if auto-create fails, metrics export is disabled (tracing still works).
+
+Environment override used for run creation:
+
+- `MLFLOW_EXPERIMENT_ID` (default: `0`).
 
 ## Dynamic metric labels
 
@@ -93,7 +159,7 @@ Filtering precedence:
 
 Default config behavior keeps CubeCL/CUDA backend context logs hidden to reduce dashboard noise.
 
-## MLflow OTLP over reverse SSH (repeatable runbook)
+## MLflow over reverse SSH (repeatable runbook)
 
 Use this when training runs on a remote host (e.g. `BareMetal`) and MLflow runs on your laptop.
 
@@ -101,6 +167,7 @@ Use this when training runs on a remote host (e.g. `BareMetal`) and MLflow runs 
 
 - OTLP endpoint must be `http://localhost:5000/v1/traces` on the remote training host.
 - MLflow OTLP header must be present: `x-mlflow-experiment-id` (configured in `src/telemetry.rs`).
+- Metrics endpoint is derived automatically from the base URI: `http://localhost:5000/api/2.0/mlflow/runs/log-batch`.
 
 ### SSH config (laptop)
 

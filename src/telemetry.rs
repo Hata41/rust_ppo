@@ -1,19 +1,29 @@
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant};
 use anyhow::{anyhow, Result};
 use chrono::Utc;
 use crossbeam_channel::{Receiver, Sender};
+use opentelemetry::trace::TracerProvider as _;
+use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_otlp::WithHttpConfig;
+use opentelemetry_sdk::trace::{BatchConfigBuilder, BatchSpanProcessor, SdkTracerProvider};
+use opentelemetry_sdk::Resource;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use tracing::field::{Field, Visit};
 use tracing::{Event, Subscriber};
+use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::fmt::format::{FormatEvent, FormatFields, Writer};
 use tracing_subscriber::fmt::FmtContext;
 use tracing_subscriber::Layer;
 use tracing_subscriber::registry::LookupSpan;
+use tracing_subscriber::Registry;
+
+static OTLP_PROVIDER: OnceLock<SdkTracerProvider> = OnceLock::new();
 
 #[derive(Default)]
 pub struct DashboardVisitor {
@@ -236,7 +246,7 @@ struct CreateRunInfo {
 }
 
 #[derive(Clone)]
-pub struct MlflowLayer {
+pub struct MlflowMetricsLayer {
     tx: Sender<Metric>,
     run_id: String,
 }
@@ -246,6 +256,7 @@ struct NumericMetricVisitor {
     metrics: Vec<(String, f64)>,
     step: Option<i64>,
     message: Option<String>,
+    category: Option<String>,
 }
 
 impl NumericMetricVisitor {
@@ -262,6 +273,21 @@ impl NumericMetricVisitor {
             return;
         }
         self.metrics.push((name.to_string(), value));
+    }
+
+    fn category_prefix(&self) -> &'static str {
+        match self
+            .category
+            .as_deref()
+            .unwrap_or("MISC")
+            .to_ascii_uppercase()
+            .as_str()
+        {
+            "TRAINER" | "TRAIN" => "trainer/",
+            "ACTOR" | "ACT" => "actor/",
+            "EVALUATOR" | "EVAL" => "evaluator/",
+            _ => "misc/",
+        }
     }
 
     fn should_skip_event(&self) -> bool {
@@ -291,15 +317,27 @@ impl Visit for NumericMetricVisitor {
     }
 
     fn record_str(&mut self, field: &Field, value: &str) {
+        if field.name() == "category" {
+            self.category = Some(value.to_string());
+            return;
+        }
         if field.name() == "message" {
             self.message = Some(value.to_string());
         }
     }
 
-    fn record_debug(&mut self, _field: &Field, _value: &dyn fmt::Debug) {}
+    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+        if field.name() == "category" {
+            self.category = Some(format!("{value:?}").trim_matches('"').to_string());
+            return;
+        }
+        if field.name() == "message" {
+            self.message = Some(format!("{value:?}").trim_matches('"').to_string());
+        }
+    }
 }
 
-impl<S> Layer<S> for MlflowLayer
+impl<S> Layer<S> for MlflowMetricsLayer
 where
     S: Subscriber,
 {
@@ -320,9 +358,10 @@ where
         }
 
         let timestamp = Utc::now().timestamp_millis();
+        let prefix = visitor.category_prefix();
         for (key, value) in visitor.metrics {
             let metric = Metric {
-                key,
+            key: format!("{prefix}{key}"),
                 value,
                 timestamp,
                 step,
@@ -437,7 +476,7 @@ fn worker_loop(rx: Receiver<Metric>, run_id: String, uri: String) {
     }
 }
 
-pub fn init_mlflow_metrics(run_id: &str, uri: &str) -> MlflowLayer {
+pub fn init_mlflow_metrics(run_id: &str, uri: &str) -> MlflowMetricsLayer {
     let (tx, rx) = crossbeam_channel::unbounded::<Metric>();
     let thread_run_id = run_id.to_string();
     let thread_uri = uri.to_string();
@@ -446,9 +485,53 @@ pub fn init_mlflow_metrics(run_id: &str, uri: &str) -> MlflowLayer {
         .name("mlflow-metrics-worker".to_string())
         .spawn(move || worker_loop(rx, thread_run_id, thread_uri));
 
-    MlflowLayer {
+    MlflowMetricsLayer {
         tx,
         run_id: run_id.to_string(),
+    }
+}
+
+pub fn init_otlp_layer(
+    service_name: &str,
+    endpoint: &str,
+    experiment_id: &str,
+) -> Result<OpenTelemetryLayer<Registry, opentelemetry_sdk::trace::Tracer>> {
+    let mut headers = HashMap::new();
+    headers.insert(
+        "x-mlflow-experiment-id".to_string(),
+        experiment_id.to_string(),
+    );
+
+    let exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_http()
+        .with_endpoint(endpoint)
+        .with_headers(headers)
+        .build()?;
+
+    let batch_config = BatchConfigBuilder::default()
+        .with_max_queue_size(4096)
+        .with_max_export_batch_size(512)
+        .build();
+
+    let span_processor = BatchSpanProcessor::builder(exporter)
+        .with_batch_config(batch_config)
+        .build();
+
+    let provider = SdkTracerProvider::builder()
+        .with_span_processor(span_processor)
+        .with_resource(Resource::builder().with_service_name(service_name.to_string()).build())
+        .build();
+
+    let tracer = provider.tracer(service_name.to_string());
+    let _ = OTLP_PROVIDER.set(provider.clone());
+    opentelemetry::global::set_tracer_provider(provider);
+
+    Ok(tracing_opentelemetry::layer().with_tracer(tracer))
+}
+
+pub fn shutdown_otlp_provider() {
+    if let Some(provider) = OTLP_PROVIDER.get() {
+        let _ = provider.shutdown();
     }
 }
 

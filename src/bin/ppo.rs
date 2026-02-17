@@ -11,7 +11,8 @@ use rust_rl::backend::{resolve_backend, RuntimeBackend};
 use rust_rl::config::{Args, DistInfo};
 use rust_rl::ppo::train;
 use rust_rl::telemetry::{
-    create_mlflow_run, init_mlflow_metrics, DashboardFormatter, MetricRegistry,
+    create_mlflow_run, init_mlflow_metrics, init_otlp_layer, shutdown_otlp_provider,
+    DashboardFormatter, MetricRegistry,
 };
 
 fn main() -> Result<()> {
@@ -56,7 +57,23 @@ fn main() -> Result<()> {
         let mlflow_layer = run_id
             .as_deref()
             .map(|resolved_run_id| init_mlflow_metrics(resolved_run_id, &args.otlp_endpoint));
+
+        let otlp_endpoint = if args.otlp_endpoint.ends_with("/v1/traces") {
+            args.otlp_endpoint.clone()
+        } else {
+            format!("{}/v1/traces", args.otlp_endpoint.trim_end_matches('/'))
+        };
+        let experiment_id = std::env::var("MLFLOW_EXPERIMENT_ID").unwrap_or_else(|_| "0".to_string());
+        let otlp_layer = match init_otlp_layer("rust_rl.ppo", &otlp_endpoint, &experiment_id) {
+            Ok(layer) => Some(layer),
+            Err(error) => {
+                eprintln!("failed to initialize OTLP tracing: {error}");
+                None
+            }
+        };
+
         let _ = tracing_subscriber::registry()
+            .with(otlp_layer)
             .with(mlflow_layer)
             .with(filter)
             .with(fmt_layer)
@@ -72,5 +89,6 @@ fn main() -> Result<()> {
         }
     };
 
+    shutdown_otlp_provider();
     result
 }
