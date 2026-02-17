@@ -16,12 +16,17 @@ use serde::{Deserialize, Serialize};
 use tracing::field::{Field, Visit};
 use tracing::{Event, Subscriber};
 use tracing_opentelemetry::OpenTelemetryLayer;
+use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::fmt::format::{FormatEvent, FormatFields, Writer};
 use tracing_subscriber::fmt::FmtContext;
+use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::Layer;
 use tracing_subscriber::registry::LookupSpan;
+use tracing_subscriber::EnvFilter;
 use tracing_subscriber::Registry;
+
+use crate::config::{Args, DistInfo};
 
 static OTLP_PROVIDER: OnceLock<SdkTracerProvider> = OnceLock::new();
 
@@ -90,6 +95,95 @@ impl Visit for DashboardVisitor {
 #[derive(Default, Clone)]
 pub struct MetricRegistry {
     labels: HashMap<String, String>,
+}
+
+#[derive(Clone)]
+pub struct TrainingContext {
+    pub metrics: MetricRegistry,
+    pub mlflow_run_id: Option<String>,
+    pub is_lead: bool,
+}
+
+impl TrainingContext {
+    pub fn initialize(service_name: &str, args: &Args, dist: DistInfo) -> Self {
+        let metrics = MetricRegistry::with_defaults().with_env_overrides();
+
+        if dist.rank != 0 {
+            return Self {
+                metrics,
+                mlflow_run_id: None,
+                is_lead: false,
+            };
+        }
+
+        let formatter = DashboardFormatter::new(metrics.clone());
+        let filter = EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new(args.default_tracing_filter()));
+        let fmt_layer = tracing_subscriber::fmt::layer()
+            .with_target(false)
+            .with_level(false)
+            .without_time()
+            .with_file(false)
+            .with_line_number(false)
+            .with_thread_ids(false)
+            .with_thread_names(false)
+            .event_format(formatter);
+
+        let run_id = if let Some(run_id) = args.mlflow_run_id.clone() {
+            Some(run_id)
+        } else {
+            let experiment_id =
+                std::env::var("MLFLOW_EXPERIMENT_ID").unwrap_or_else(|_| "0".to_string());
+            let run_name = format!("{}.pid-{}", service_name, std::process::id());
+            match create_mlflow_run(&args.otlp_endpoint, &experiment_id, &run_name) {
+                Ok(run_id) => {
+                    eprintln!(
+                        "created MLflow run_id='{run_id}' in experiment_id='{experiment_id}'"
+                    );
+                    Some(run_id)
+                }
+                Err(error) => {
+                    eprintln!(
+                        "warning: missing --mlflow-run-id and auto-create failed: {error}; MLflow metrics export is disabled"
+                    );
+                    None
+                }
+            }
+        };
+
+        let mlflow_layer = run_id
+            .as_deref()
+            .map(|resolved_run_id| init_mlflow_metrics(resolved_run_id, &args.otlp_endpoint));
+
+        let otlp_endpoint = if args.otlp_endpoint.ends_with("/v1/traces") {
+            args.otlp_endpoint.clone()
+        } else {
+            format!("{}/v1/traces", args.otlp_endpoint.trim_end_matches('/'))
+        };
+        let experiment_id = std::env::var("MLFLOW_EXPERIMENT_ID").unwrap_or_else(|_| "0".to_string());
+        let otlp_layer = match init_otlp_layer(service_name, &otlp_endpoint, &experiment_id) {
+            Ok(layer) => Some(layer),
+            Err(error) => {
+                eprintln!("failed to initialize OTLP tracing: {error}");
+                None
+            }
+        };
+
+        let _ = tracing_subscriber::registry()
+            .with(otlp_layer)
+            .with(mlflow_layer)
+            .with(filter)
+            .with(fmt_layer)
+            .try_init();
+
+        tracing::info!(category = "MISC", config = ?args, "config_trace");
+
+        Self {
+            metrics,
+            mlflow_run_id: run_id,
+            is_lead: true,
+        }
+    }
 }
 
 impl MetricRegistry {

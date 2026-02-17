@@ -10,18 +10,18 @@
 
 environment:
   task_id: "BinPack-v0"
-  num_envs: 8
+  num_envs: 64
   max_items: 20
   max_ems: 40
-  max_episode_steps: 80
+  max_episode_steps: 20
 
 training_core:
   # Used by SPO trainer for rollout/update scheduling.
-  rollout_length: 8
+  rollout_length: 20
   num_updates: 2
   epochs: 1
-  num_minibatches: 1
-  gamma: 0.99
+  num_minibatches: 16
+  gamma: 1.0
 
 optimization:
   actor_lr: 0.0003
@@ -30,17 +30,17 @@ optimization:
   tau: 0.005
 
 architecture:
-  hidden_dim: 8
+  hidden_dim: 16
   seed: 42
 
 evaluation:
-  eval_interval: 5
-  num_eval_envs: 8
-  num_eval_episodes: 8
+  eval_interval: 1
+  num_eval_envs: 64
+  num_eval_episodes: 64
 
 hardware:
-  device_type: "cpu"
-  cuda_device: 0
+  device_type: "cuda"
+  cuda_device: 1
 
 logging:
   # Base tracing level used when RUST_LOG is not set

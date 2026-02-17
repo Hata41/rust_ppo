@@ -2,12 +2,27 @@ use anyhow::{Context, Result};
 use clap::{parser::ValueSource, ArgMatches, CommandFactory, Parser, ValueEnum};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
+use std::ops::Deref;
 
 #[derive(Copy, Clone, Debug, ValueEnum, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum DeviceType {
     Cuda,
     Cpu,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ObservationAdapterKind {
+    Dense,
+    Binpack,
+}
+
+#[derive(Clone, Copy)]
+enum TrainingAlgorithm {
+    Unified,
+    Ppo,
+    Spo,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -104,6 +119,10 @@ pub struct Args {
     /// Hidden dim of MLP
     #[arg(long, default_value_t = 256)]
     pub hidden_dim: usize,
+
+    /// Explicit observation adapter selection. If omitted, adapter is auto-detected from env metadata.
+    #[arg(long, value_enum)]
+    pub observation_adapter: Option<ObservationAdapterKind>,
 
     /// RNG seed
     #[arg(long, default_value_t = 0)]
@@ -242,6 +261,7 @@ impl Default for Args {
             reward_scale: 1.0,
             standardize_advantages: true,
             hidden_dim: 256,
+            observation_adapter: None,
             seed: 0,
             cuda_device: 0,
             device_type: DeviceType::Cuda,
@@ -360,7 +380,50 @@ struct SpoConfig {
 #[serde(default, deny_unknown_fields)]
 struct ArchitectureConfig {
     hidden_dim: Option<usize>,
+    observation_adapter: Option<ObservationAdapterKind>,
     seed: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PpoArgs(Args);
+
+impl PpoArgs {
+    pub fn load() -> Result<Self> {
+        Ok(Self(Args::load_for_algorithm(TrainingAlgorithm::Ppo)?))
+    }
+
+    pub fn into_inner(self) -> Args {
+        self.0
+    }
+}
+
+impl Deref for PpoArgs {
+    type Target = Args;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SpoArgs(Args);
+
+impl SpoArgs {
+    pub fn load() -> Result<Self> {
+        Ok(Self(Args::load_for_algorithm(TrainingAlgorithm::Spo)?))
+    }
+
+    pub fn into_inner(self) -> Args {
+        self.0
+    }
+}
+
+impl Deref for SpoArgs {
+    type Target = Args;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -391,6 +454,10 @@ impl Args {
     }
 
     pub fn load() -> Result<Self> {
+        Self::load_for_algorithm(TrainingAlgorithm::Unified)
+    }
+
+    fn load_for_algorithm(algo: TrainingAlgorithm) -> Result<Self> {
         let argv = std::env::args_os().collect::<Vec<_>>();
         let cli_args = Self::try_parse_from(&argv)
             .map_err(|e| anyhow::anyhow!(e.to_string()))
@@ -403,7 +470,7 @@ impl Args {
         let mut merged = Self::default();
 
         if let Some(config_path) = cli_args.config.as_deref() {
-            let file_config = Self::load_file_config(config_path)?;
+            let file_config = Self::load_file_config(config_path, algo)?;
             merged.apply_config_file(file_config);
         }
 
@@ -413,7 +480,7 @@ impl Args {
         Ok(merged)
     }
 
-    fn load_file_config(path: &Path) -> Result<FileConfig> {
+    fn load_file_config(path: &Path, algo: TrainingAlgorithm) -> Result<FileConfig> {
         let resolved = if path.is_absolute() {
             path.to_path_buf()
         } else {
@@ -424,6 +491,17 @@ impl Args {
 
         let content = std::fs::read_to_string(&resolved)
             .with_context(|| format!("failed to read config file at {}", resolved.display()))?;
+
+        if matches!(algo, TrainingAlgorithm::Ppo) {
+            let mut value = serde_yaml::from_str::<serde_yaml::Value>(&content).with_context(|| {
+                format!("failed to parse YAML config at {}", resolved.display())
+            })?;
+            if let Some(mapping) = value.as_mapping_mut() {
+                mapping.remove(serde_yaml::Value::String("spo".to_string()));
+            }
+            return serde_yaml::from_value::<FileConfig>(value)
+                .with_context(|| format!("failed to parse YAML config at {}", resolved.display()));
+        }
 
         serde_yaml::from_str::<FileConfig>(&content)
             .with_context(|| format!("failed to parse YAML config at {}", resolved.display()))
@@ -466,6 +544,9 @@ impl Args {
         set_if_some!(tau, file.optimization.tau);
 
         set_if_some!(hidden_dim, file.architecture.hidden_dim);
+        if let Some(value) = file.architecture.observation_adapter {
+            self.observation_adapter = Some(value);
+        }
         set_if_some!(seed, file.architecture.seed);
 
         set_if_some!(eval_interval, file.evaluation.eval_interval);
@@ -542,6 +623,7 @@ impl Args {
         set_if_cli!(tau, "tau");
 
         set_if_cli!(hidden_dim, "hidden_dim");
+        set_if_cli!(observation_adapter, "observation_adapter");
         set_if_cli!(seed, "seed");
 
         set_if_cli!(eval_interval, "eval_interval");

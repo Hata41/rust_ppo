@@ -9,7 +9,7 @@ use rustpool::core::types::GenericObs;
 
 use crate::config::Args;
 use crate::env::{AsyncEnvPool, StepOut};
-use crate::env_model::{build_actor_input_batch, build_critic_input_batch, EnvModelKind};
+use crate::env_model::ObservationAdapter;
 use crate::models::Agent;
 use crate::ppo::loss::sample_actions_categorical;
 
@@ -155,7 +155,7 @@ pub fn run_smc_search<B: Backend>(
     root_state_ids: &[i32],
     root_obs: &[&rustpool::core::types::GenericObs],
     root_action_masks: &[&[bool]],
-    model_kind: EnvModelKind,
+    adapter: &dyn ObservationAdapter<B>,
     args: &Args,
     cfg: SearchConfig,
     obs_dim: usize,
@@ -221,12 +221,11 @@ pub fn run_smc_search<B: Backend>(
             }
         }
 
-        let actor_input =
-            build_actor_input_batch::<B>(&current_obs, model_kind, args, obs_dim, device)?;
+        let current_obs_refs = current_obs.iter().collect::<Vec<_>>();
+        let actor_input = adapter.build_actor_input_batch(&current_obs_refs, args, obs_dim, device)?;
         let current_values_t = agent
-            .critic_values(build_critic_input_batch::<B>(
-                &current_obs,
-                model_kind,
+            .critic_values(adapter.build_critic_input_batch(
+                &current_obs_refs,
                 args,
                 obs_dim,
                 device,
@@ -262,9 +261,13 @@ pub fn run_smc_search<B: Backend>(
 
         let steps = env.simulate_batch(&current_state_ids, &actions)?;
         let next_obs = steps.iter().map(|s| s.obs.clone()).collect::<Vec<_>>();
+        let next_obs_refs = next_obs.iter().collect::<Vec<_>>();
         let next_values_t = agent
-            .critic_values(build_critic_input_batch::<B>(
-                &next_obs, model_kind, args, obs_dim, device,
+            .critic_values(adapter.build_critic_input_batch(
+                &next_obs_refs,
+                args,
+                obs_dim,
+                device,
             )?)
             .reshape([n]);
         let next_values = next_values_t

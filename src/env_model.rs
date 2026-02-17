@@ -3,19 +3,59 @@ use burn::tensor::backend::Backend;
 use burn::tensor::{Bool, Tensor, TensorData};
 use rustpool::core::rl_env::RlEnv;
 use rustpool::core::types::GenericObs;
-use std::borrow::Borrow;
 
-use crate::config::Args;
+use crate::config::{Args, ObservationAdapterKind};
 use crate::models::{ActorInput, CriticInput, PolicyInput};
 use crate::ppo::buffer::{flatten_obs, flatten_obs_into, parse_binpack_obs};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum EnvModelKind {
-    Dense,
-    BinPackStructured,
+pub trait ObservationAdapter<B: Backend>: Send + Sync {
+    fn uses_binpack_architecture(&self) -> bool;
+
+    fn infer_obs_dim(&self, first_obs: &GenericObs, args: &Args) -> usize;
+
+    fn build_actor_input_batch(
+        &self,
+        obs_batch: &[&GenericObs],
+        args: &Args,
+        obs_dim: usize,
+        device: &B::Device,
+    ) -> Result<ActorInput<B>>;
+
+    fn build_critic_input_batch(
+        &self,
+        obs_batch: &[&GenericObs],
+        args: &Args,
+        obs_dim: usize,
+        device: &B::Device,
+    ) -> Result<CriticInput<B>>;
+
+    fn build_policy_input_batch(
+        &self,
+        obs_batch: &[&GenericObs],
+        args: &Args,
+        obs_dim: usize,
+        device: &B::Device,
+    ) -> Result<PolicyInput<B>>;
+
+    fn build_policy_input_from_binpack_parts(
+        &self,
+        items_mb: Vec<f32>,
+        ems_mb: Vec<f32>,
+        items_valid_mb: Vec<bool>,
+        ems_valid_mb: Vec<bool>,
+        batch_size: usize,
+        args: &Args,
+        device: &B::Device,
+    ) -> Result<PolicyInput<B>>;
 }
 
-pub fn detect_env_model_from_metadata(env: &dyn RlEnv) -> EnvModelKind {
+#[derive(Default)]
+pub struct DenseObservationAdapter;
+
+#[derive(Default)]
+pub struct BinPackObservationAdapter;
+
+pub fn detect_env_model_from_metadata(env: &dyn RlEnv) -> ObservationAdapterKind {
     let keys = env
         .obs_keys()
         .into_iter()
@@ -25,16 +65,97 @@ pub fn detect_env_model_from_metadata(env: &dyn RlEnv) -> EnvModelKind {
     let has_items = keys.iter().any(|k| k.contains("item"));
     let has_ems = keys.iter().any(|k| k.contains("ems"));
     if has_items && has_ems {
-        EnvModelKind::BinPackStructured
+        ObservationAdapterKind::Binpack
     } else {
-        EnvModelKind::Dense
+        ObservationAdapterKind::Dense
     }
 }
 
-pub fn infer_obs_dim(first_obs: &GenericObs, model_kind: EnvModelKind, args: &Args) -> usize {
-    match model_kind {
-        EnvModelKind::Dense => flatten_obs(first_obs).len(),
-        EnvModelKind::BinPackStructured => args.max_items * 3 + args.max_ems * 6,
+pub fn resolve_observation_adapter<B: Backend>(
+    env: &dyn RlEnv,
+    args: &Args,
+) -> Box<dyn ObservationAdapter<B>> {
+    let adapter_kind = args
+        .observation_adapter
+        .unwrap_or_else(|| detect_env_model_from_metadata(env));
+
+    match adapter_kind {
+        ObservationAdapterKind::Dense => Box::new(DenseObservationAdapter),
+        ObservationAdapterKind::Binpack => Box::new(BinPackObservationAdapter),
+    }
+}
+
+impl<B: Backend> ObservationAdapter<B> for DenseObservationAdapter {
+    fn uses_binpack_architecture(&self) -> bool {
+        false
+    }
+
+    fn infer_obs_dim(&self, first_obs: &GenericObs, _args: &Args) -> usize {
+        flatten_obs(first_obs).len()
+    }
+
+    fn build_actor_input_batch(
+        &self,
+        obs_batch: &[&GenericObs],
+        _args: &Args,
+        obs_dim: usize,
+        device: &B::Device,
+    ) -> Result<ActorInput<B>> {
+        let batch = obs_batch.len();
+        let mut obs_flat = vec![0.0f32; batch * obs_dim];
+        for (e, obs) in obs_batch.iter().enumerate() {
+            let base = e * obs_dim;
+            flatten_obs_into(obs, &mut obs_flat[base..base + obs_dim]);
+        }
+        let obs_t = Tensor::<B, 2>::from_data(TensorData::new(obs_flat, [batch, obs_dim]), device);
+        Ok(ActorInput::Dense { obs: obs_t })
+    }
+
+    fn build_critic_input_batch(
+        &self,
+        obs_batch: &[&GenericObs],
+        _args: &Args,
+        obs_dim: usize,
+        device: &B::Device,
+    ) -> Result<CriticInput<B>> {
+        let batch = obs_batch.len();
+        let mut obs_flat = vec![0.0f32; batch * obs_dim];
+        for (e, obs) in obs_batch.iter().enumerate() {
+            let base = e * obs_dim;
+            flatten_obs_into(obs, &mut obs_flat[base..base + obs_dim]);
+        }
+        let obs_t = Tensor::<B, 2>::from_data(TensorData::new(obs_flat, [batch, obs_dim]), device);
+        Ok(CriticInput::Dense { obs: obs_t })
+    }
+
+    fn build_policy_input_batch(
+        &self,
+        obs_batch: &[&GenericObs],
+        _args: &Args,
+        obs_dim: usize,
+        device: &B::Device,
+    ) -> Result<PolicyInput<B>> {
+        let batch = obs_batch.len();
+        let mut obs_flat = vec![0.0f32; batch * obs_dim];
+        for (e, obs) in obs_batch.iter().enumerate() {
+            let base = e * obs_dim;
+            flatten_obs_into(obs, &mut obs_flat[base..base + obs_dim]);
+        }
+        let obs_t = Tensor::<B, 2>::from_data(TensorData::new(obs_flat, [batch, obs_dim]), device);
+        Ok(PolicyInput::Dense { obs: obs_t })
+    }
+
+    fn build_policy_input_from_binpack_parts(
+        &self,
+        _items_mb: Vec<f32>,
+        _ems_mb: Vec<f32>,
+        _items_valid_mb: Vec<bool>,
+        _ems_valid_mb: Vec<bool>,
+        _batch_size: usize,
+        _args: &Args,
+        _device: &B::Device,
+    ) -> Result<PolicyInput<B>> {
+        anyhow::bail!("dense observation adapter does not support binpack policy tensor construction")
     }
 }
 
@@ -48,7 +169,7 @@ type BinPackBatch<B> = (
 );
 
 fn build_binpack_batch_tensors<B: Backend>(
-    obs_batch: &[impl Borrow<GenericObs>],
+    obs_batch: &[&GenericObs],
     args: &Args,
     device: &B::Device,
 ) -> Result<BinPackBatch<B>> {
@@ -61,7 +182,7 @@ fn build_binpack_batch_tensors<B: Backend>(
     let mut ems_valid_f32 = vec![0.0f32; batch * args.max_ems];
 
     for (row, obs) in obs_batch.iter().enumerate() {
-        let parsed = parse_binpack_obs(obs.borrow(), args.max_items, args.max_ems)?;
+        let parsed = parse_binpack_obs(obs, args.max_items, args.max_ems)?;
 
         let items_base = row * args.max_items * 3;
         let ems_base = row * args.max_ems * 6;
@@ -111,115 +232,80 @@ fn build_binpack_batch_tensors<B: Backend>(
     ))
 }
 
-pub fn build_actor_input_batch<B: Backend>(
-    obs_batch: &[impl Borrow<GenericObs>],
-    model_kind: EnvModelKind,
-    args: &Args,
-    obs_dim: usize,
-    device: &B::Device,
-) -> Result<ActorInput<B>> {
-    Ok(match model_kind {
-        EnvModelKind::Dense => {
-            let batch = obs_batch.len();
-            let mut obs_flat = vec![0.0f32; batch * obs_dim];
-            for (e, obs) in obs_batch.iter().enumerate() {
-                let base = e * obs_dim;
-                flatten_obs_into(obs.borrow(), &mut obs_flat[base..base + obs_dim]);
-            }
-            let obs_t =
-                Tensor::<B, 2>::from_data(TensorData::new(obs_flat, [batch, obs_dim]), device);
-            ActorInput::Dense { obs: obs_t }
-        }
-        EnvModelKind::BinPackStructured => {
-            let (items_t, ems_t, items_pad_t, ems_pad_t, _, _) =
-                build_binpack_batch_tensors::<B>(obs_batch, args, device)?;
-            ActorInput::BinPack {
-                ems: ems_t,
-                items: items_t,
-                ems_pad_mask: ems_pad_t,
-                items_pad_mask: items_pad_t,
-            }
-        }
-    })
-}
+impl<B: Backend> ObservationAdapter<B> for BinPackObservationAdapter {
+    fn uses_binpack_architecture(&self) -> bool {
+        true
+    }
 
-pub fn build_critic_input_batch<B: Backend>(
-    obs_batch: &[impl Borrow<GenericObs>],
-    model_kind: EnvModelKind,
-    args: &Args,
-    obs_dim: usize,
-    device: &B::Device,
-) -> Result<CriticInput<B>> {
-    Ok(match model_kind {
-        EnvModelKind::Dense => {
-            let batch = obs_batch.len();
-            let mut obs_flat = vec![0.0f32; batch * obs_dim];
-            for (e, obs) in obs_batch.iter().enumerate() {
-                let base = e * obs_dim;
-                flatten_obs_into(obs.borrow(), &mut obs_flat[base..base + obs_dim]);
-            }
-            let obs_t =
-                Tensor::<B, 2>::from_data(TensorData::new(obs_flat, [batch, obs_dim]), device);
-            CriticInput::Dense { obs: obs_t }
-        }
-        EnvModelKind::BinPackStructured => {
-            let (items_t, ems_t, items_pad_t, ems_pad_t, items_valid_t, ems_valid_t) =
-                build_binpack_batch_tensors::<B>(obs_batch, args, device)?;
-            CriticInput::BinPack {
-                ems: ems_t,
-                items: items_t,
-                ems_pad_mask: ems_pad_t,
-                items_pad_mask: items_pad_t,
-                ems_valid_f32: ems_valid_t,
-                items_valid_f32: items_valid_t,
-            }
-        }
-    })
-}
+    fn infer_obs_dim(&self, _first_obs: &GenericObs, args: &Args) -> usize {
+        args.max_items * 3 + args.max_ems * 6
+    }
 
-pub fn build_policy_input_batch<B: Backend>(
-    obs_batch: &[impl Borrow<GenericObs>],
-    model_kind: EnvModelKind,
-    args: &Args,
-    obs_dim: usize,
-    device: &B::Device,
-) -> Result<PolicyInput<B>> {
-    Ok(match model_kind {
-        EnvModelKind::Dense => {
-            let batch = obs_batch.len();
-            let mut obs_flat = vec![0.0f32; batch * obs_dim];
-            for (e, obs) in obs_batch.iter().enumerate() {
-                let base = e * obs_dim;
-                flatten_obs_into(obs.borrow(), &mut obs_flat[base..base + obs_dim]);
-            }
-            let obs_t =
-                Tensor::<B, 2>::from_data(TensorData::new(obs_flat, [batch, obs_dim]), device);
-            PolicyInput::Dense { obs: obs_t }
-        }
-        EnvModelKind::BinPackStructured => {
-            let (items_t, ems_t, items_pad_t, ems_pad_t, items_valid_t, ems_valid_t) =
-                build_binpack_batch_tensors::<B>(obs_batch, args, device)?;
-            PolicyInput::BinPack {
-                ems: ems_t,
-                items: items_t,
-                ems_pad_mask: ems_pad_t,
-                items_pad_mask: items_pad_t,
-                ems_valid_f32: ems_valid_t,
-                items_valid_f32: items_valid_t,
-            }
-        }
-    })
-}
+    fn build_actor_input_batch(
+        &self,
+        obs_batch: &[&GenericObs],
+        args: &Args,
+        _obs_dim: usize,
+        device: &B::Device,
+    ) -> Result<ActorInput<B>> {
+        let (items_t, ems_t, items_pad_t, ems_pad_t, _, _) =
+            build_binpack_batch_tensors::<B>(obs_batch, args, device)?;
+        Ok(ActorInput::BinPack {
+            ems: ems_t,
+            items: items_t,
+            ems_pad_mask: ems_pad_t,
+            items_pad_mask: items_pad_t,
+        })
+    }
 
-pub fn build_policy_input_from_binpack_parts<B: Backend>(
-    items_mb: Vec<f32>,
-    ems_mb: Vec<f32>,
-    items_valid_mb: Vec<bool>,
-    ems_valid_mb: Vec<bool>,
-    batch_size: usize,
-    args: &Args,
-    device: &B::Device,
-) -> PolicyInput<B> {
+    fn build_critic_input_batch(
+        &self,
+        obs_batch: &[&GenericObs],
+        args: &Args,
+        _obs_dim: usize,
+        device: &B::Device,
+    ) -> Result<CriticInput<B>> {
+        let (items_t, ems_t, items_pad_t, ems_pad_t, items_valid_t, ems_valid_t) =
+            build_binpack_batch_tensors::<B>(obs_batch, args, device)?;
+        Ok(CriticInput::BinPack {
+            ems: ems_t,
+            items: items_t,
+            ems_pad_mask: ems_pad_t,
+            items_pad_mask: items_pad_t,
+            ems_valid_f32: ems_valid_t,
+            items_valid_f32: items_valid_t,
+        })
+    }
+
+    fn build_policy_input_batch(
+        &self,
+        obs_batch: &[&GenericObs],
+        args: &Args,
+        _obs_dim: usize,
+        device: &B::Device,
+    ) -> Result<PolicyInput<B>> {
+        let (items_t, ems_t, items_pad_t, ems_pad_t, items_valid_t, ems_valid_t) =
+            build_binpack_batch_tensors::<B>(obs_batch, args, device)?;
+        Ok(PolicyInput::BinPack {
+            ems: ems_t,
+            items: items_t,
+            ems_pad_mask: ems_pad_t,
+            items_pad_mask: items_pad_t,
+            ems_valid_f32: ems_valid_t,
+            items_valid_f32: items_valid_t,
+        })
+    }
+
+    fn build_policy_input_from_binpack_parts(
+        &self,
+        items_mb: Vec<f32>,
+        ems_mb: Vec<f32>,
+        items_valid_mb: Vec<bool>,
+        ems_valid_mb: Vec<bool>,
+        batch_size: usize,
+        args: &Args,
+        device: &B::Device,
+    ) -> Result<PolicyInput<B>> {
     let items_t = Tensor::<B, 3>::from_data(
         TensorData::new(items_mb, [batch_size, args.max_items, 3]),
         device,
@@ -262,12 +348,13 @@ pub fn build_policy_input_from_binpack_parts<B: Backend>(
         device,
     );
 
-    PolicyInput::BinPack {
+        Ok(PolicyInput::BinPack {
         ems: ems_t,
         items: items_t,
         ems_pad_mask: ems_pad_t,
         items_pad_mask: items_pad_t,
         ems_valid_f32: ems_valid_t,
         items_valid_f32: items_valid_t,
+        })
     }
 }

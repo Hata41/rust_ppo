@@ -243,27 +243,56 @@ impl<B: burn::tensor::backend::Backend> BinPackCritic<B> {
 }
 
 #[derive(Module, Debug)]
-pub struct Actor<B: burn::tensor::backend::Backend> {
+pub struct DenseActor<B: burn::tensor::backend::Backend> {
     torso: Mlp<B>,
     head: Linear<B>,
-    binpack: BinPackActor<B>,
 }
 
-impl<B: burn::tensor::backend::Backend> Actor<B> {
+impl<B: burn::tensor::backend::Backend> DenseActor<B> {
     pub fn new(obs_dim: usize, hidden: usize, action_dim: usize, device: &B::Device) -> Self {
         let torso = Mlp::new(obs_dim, hidden, device);
         let head = LinearConfig::new(hidden, action_dim).init(device);
-        let binpack = BinPackActor::new(hidden, device);
-        Self {
-            torso,
-            head,
-            binpack,
-        }
+        Self { torso, head }
     }
 
     pub fn forward(&self, obs: Tensor<B, 2>) -> Tensor<B, 2> {
         let h = self.torso.forward(obs);
         self.head.forward(h)
+    }
+}
+
+#[derive(Module, Debug)]
+pub struct Actor<B: burn::tensor::backend::Backend> {
+    dense: Option<DenseActor<B>>,
+    binpack: Option<BinPackActor<B>>,
+}
+
+impl<B: burn::tensor::backend::Backend> Actor<B> {
+    pub fn new(
+        obs_dim: usize,
+        hidden: usize,
+        action_dim: usize,
+        use_binpack_architecture: bool,
+        device: &B::Device,
+    ) -> Self {
+        if use_binpack_architecture {
+            Self {
+                dense: None,
+                binpack: Some(BinPackActor::new(hidden, device)),
+            }
+        } else {
+            Self {
+                dense: Some(DenseActor::new(obs_dim, hidden, action_dim, device)),
+                binpack: None,
+            }
+        }
+    }
+
+    pub fn forward(&self, obs: Tensor<B, 2>) -> Tensor<B, 2> {
+        self.dense
+            .as_ref()
+            .expect("dense actor requested but dense architecture is disabled")
+            .forward(obs)
     }
 
     pub fn forward_binpack(
@@ -274,6 +303,8 @@ impl<B: burn::tensor::backend::Backend> Actor<B> {
         items_pad_mask: Tensor<B, 2, Bool>,
     ) -> Tensor<B, 2> {
         self.binpack
+            .as_ref()
+            .expect("binpack actor requested but binpack architecture is disabled")
             .forward(ems, items, ems_pad_mask, items_pad_mask)
     }
 
@@ -291,27 +322,50 @@ impl<B: burn::tensor::backend::Backend> Actor<B> {
 }
 
 #[derive(Module, Debug)]
-pub struct Critic<B: burn::tensor::backend::Backend> {
+pub struct DenseCritic<B: burn::tensor::backend::Backend> {
     torso: Mlp<B>,
     head: Linear<B>,
-    binpack: BinPackCritic<B>,
 }
 
-impl<B: burn::tensor::backend::Backend> Critic<B> {
+impl<B: burn::tensor::backend::Backend> DenseCritic<B> {
     pub fn new(obs_dim: usize, hidden: usize, device: &B::Device) -> Self {
         let torso = Mlp::new(obs_dim, hidden, device);
         let head = LinearConfig::new(hidden, 1).init(device);
-        let binpack = BinPackCritic::new(hidden, device);
-        Self {
-            torso,
-            head,
-            binpack,
-        }
+        Self { torso, head }
     }
 
     pub fn forward(&self, obs: Tensor<B, 2>) -> Tensor<B, 2> {
         let h = self.torso.forward(obs);
         self.head.forward(h)
+    }
+}
+
+#[derive(Module, Debug)]
+pub struct Critic<B: burn::tensor::backend::Backend> {
+    dense: Option<DenseCritic<B>>,
+    binpack: Option<BinPackCritic<B>>,
+}
+
+impl<B: burn::tensor::backend::Backend> Critic<B> {
+    pub fn new(obs_dim: usize, hidden: usize, use_binpack_architecture: bool, device: &B::Device) -> Self {
+        if use_binpack_architecture {
+            Self {
+                dense: None,
+                binpack: Some(BinPackCritic::new(hidden, device)),
+            }
+        } else {
+            Self {
+                dense: Some(DenseCritic::new(obs_dim, hidden, device)),
+                binpack: None,
+            }
+        }
+    }
+
+    pub fn forward(&self, obs: Tensor<B, 2>) -> Tensor<B, 2> {
+        self.dense
+            .as_ref()
+            .expect("dense critic requested but dense architecture is disabled")
+            .forward(obs)
     }
 
     pub fn forward_binpack(
@@ -323,14 +377,17 @@ impl<B: burn::tensor::backend::Backend> Critic<B> {
         ems_valid_f32: Tensor<B, 2>,
         items_valid_f32: Tensor<B, 2>,
     ) -> Tensor<B, 2> {
-        self.binpack.forward(
+        self.binpack
+            .as_ref()
+            .expect("binpack critic requested but binpack architecture is disabled")
+            .forward(
             ems,
             items,
             ems_pad_mask,
             items_pad_mask,
             ems_valid_f32,
             items_valid_f32,
-        )
+            )
     }
 
     pub fn forward_input(&self, input: CriticInput<B>) -> Tensor<B, 2> {
@@ -402,10 +459,22 @@ pub struct Agent<B: burn::tensor::backend::Backend> {
 }
 
 impl<B: burn::tensor::backend::Backend> Agent<B> {
-    pub fn new(obs_dim: usize, hidden: usize, action_dim: usize, device: &B::Device) -> Self {
+    pub fn new(
+        obs_dim: usize,
+        hidden: usize,
+        action_dim: usize,
+        use_binpack_architecture: bool,
+        device: &B::Device,
+    ) -> Self {
         Self {
-            actor: Actor::new(obs_dim, hidden, action_dim, device),
-            critic: Critic::new(obs_dim, hidden, device),
+            actor: Actor::new(
+                obs_dim,
+                hidden,
+                action_dim,
+                use_binpack_architecture,
+                device,
+            ),
+            critic: Critic::new(obs_dim, hidden, use_binpack_architecture, device),
         }
     }
 

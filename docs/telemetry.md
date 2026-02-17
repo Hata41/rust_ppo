@@ -2,49 +2,48 @@
 
 This project uses a dual telemetry pipeline for PPO and SPO:
 
-- **Tracing (OTLP):** exports spans/events to MLflow OTLP (`/v1/traces`) for execution timelines.
-- **Metrics (REST):** exports scalar metrics to MLflow REST (`/api/2.0/mlflow/runs/log-batch`) for line charts.
+- Tracing (OTLP): spans/events export to MLflow OTLP (`/v1/traces`)
+- Metrics (REST): scalar metrics export to MLflow REST (`/api/2.0/mlflow/runs/log-batch`)
 
-Both pipelines are active in parallel from the same `tracing` events.
+Both are initialized through shared `TrainingContext::initialize(...)` in `src/telemetry.rs`.
 
-Shared modules:
+## Initialization path
 
-- formatter and category rendering: [src/telemetry.rs](../src/telemetry.rs)
-- PPO wiring: [src/bin/ppo.rs](../src/bin/ppo.rs)
-- SPO wiring: [src/bin/spo.rs](../src/bin/spo.rs)
+- PPO: `src/bin/ppo.rs`
+- SPO: `src/bin/spo.rs`
+
+Each binary:
+
+1. loads args (`PpoArgs` / `SpoArgs`)
+2. resolves dist info
+3. initializes `TrainingContext`
+4. enters trainer run path
 
 ## Categories
 
-Structured metrics are emitted under these categories:
+Shared category contract:
 
 - `TRAINER`
 - `ACTOR`
 - `EVALUATOR`
 - `MISC`
 
-Category names are normalized by formatter-level mapping.
+Category names are normalized by shared formatter logic in `src/telemetry.rs`.
 
-## MLflow metrics key mapping
+## Metric key mapping
 
-Metrics are automatically prefixed from the `category` field before being sent to MLflow:
+MLflow metric keys are prefixed by category:
 
-- `TRAINER` / `TRAIN` → `trainer/`
-- `ACTOR` / `ACT` → `actor/`
-- `EVALUATOR` / `EVAL` → `evaluator/`
-- default → `misc/`
+- `TRAINER` -> `trainer/`
+- `ACTOR` -> `actor/`
+- `EVALUATOR` -> `evaluator/`
+- fallback -> `misc/`
 
-Example:
+Only numeric fields are exported as metrics.
 
-- `tracing::info!(category="TRAINER", critic_loss=0.5, timesteps=100, "train")`
-- exported metric key: `trainer/critic_loss` (step `100`)
+## Step fields
 
-Notes:
-
-- only numeric fields are exported as metrics,
-- `category`, `message`, `telemetry` are never exported as metric keys,
-- events without an explicit step field are skipped by the metrics exporter.
-
-Accepted step fields:
+Metrics export requires a step-like field; accepted names include:
 
 - `timesteps`
 - `policy_version`
@@ -52,71 +51,24 @@ Accepted step fields:
 - `global_step`
 - `update`
 
-## Non-blocking metrics architecture
+## Runtime behavior
 
-Metrics export never performs HTTP inside `on_event`:
+- Metrics export uses non-blocking channel + background worker.
+- Batching flushes periodically and by batch size threshold.
+- Missing/failed MLflow run creation disables metrics export only; tracing can still continue.
 
-- `MlflowMetricsLayer` extracts numeric fields synchronously.
-- Metrics are pushed into a `crossbeam_channel`.
-- A background worker batches and POSTs to MLflow REST.
+## Labels
 
-Batching behavior:
-
-- flush every ~1 second, or
-- flush when batch size reaches 50.
-
-Reliability behavior:
-
-- retry transient failures up to 3 attempts,
-- request timeout is short (3s),
-- warning logs are rate-limited.
-
-## Run ID behavior (metrics)
-
-Metrics require an MLflow `run_id`.
-
-- if `--mlflow-run-id` is provided, it is used,
-- otherwise the binary attempts `runs/create` automatically,
-- if auto-create fails, metrics export is disabled (tracing still works).
-
-Environment override used for run creation:
-
-- `MLFLOW_EXPERIMENT_ID` (default: `0`).
-
-## Dynamic metric labels
-
-Metric labels come from `MetricRegistry` defaults plus optional runtime overrides.
-
-Environment variable format:
+Metric labels are controlled by `MetricRegistry` defaults and optional env override:
 
 ```bash
 RUST_RL_METRIC_LABELS="global_grad_norm=Grad Norm,steps_per_second=SPS"
 ```
 
-Rules:
+## Shared schema expectation
 
-- comma-separated `key=Label` pairs
-- unknown keys fall back to title-cased rendering
+PPO and SPO should keep telemetry schema compatibility for downstream dashboards, especially evaluator keys:
 
-## Emission producers
-
-- PPO train/eval emissions: [src/ppo/train.rs](../src/ppo/train.rs)
-- SPO train/eval emissions: [src/spo/train.rs](../src/spo/train.rs)
-
-## PPO/SPO schema compatibility contract
-
-PPO and SPO are expected to remain log-schema compatible for shared monitoring.
-
-Note:
-
-- some keys can be emitted as compatibility placeholders in one algorithm (for example when a metric is not semantically central to that method), but key presence and category contracts should remain stable for downstream consumers.
-
-### Shared evaluation schema
-
-Both should emit in `EVALUATOR` category:
-
-- `phase`
-- `policy_version`
 - `episodes`
 - `mean_return`
 - `max_return`
@@ -126,124 +78,12 @@ Both should emit in `EVALUATOR` category:
 - `episode_length_min`
 - `duration_ms`
 
-### Shared runtime categories per update
+## Remote MLflow runbook
 
-Per update, both algorithms should emit:
+Typical reverse-SSH flow:
 
-- `TRAINER` (optimization metrics)
-- `ACTOR` (episodic performance aggregates)
-- `MISC` (throughput/runtime metrics)
+1. start MLflow locally (`127.0.0.1:5000`)
+2. keep reverse tunnel open
+3. run training remotely with `otlp_endpoint` pointing to `http://localhost:5000`
 
-## Cadence expectations
-
-- PPO: emits train/update logs per update and deterministic eval on configured cadence.
-- SPO: emits train/update logs per update and deterministic search-based eval on configured cadence.
-
-Eval cadence contract:
-
-- run when `eval_interval > 0`
-- run when `update % eval_interval == 0`
-- require `num_eval_episodes > 0`
-
-See runtime sources for exact emission points:
-
-- [training-loop.md](training-loop.md) (PPO)
-- [spo-training-loop.md](spo-training-loop.md) (SPO)
-
-## Filtering
-
-Filtering precedence:
-
-- If `RUST_LOG` is set, it is used directly.
-- Otherwise, defaults come from YAML `logging` section (`log_level`, `backend_logs_visible`).
-
-Default config behavior keeps CubeCL/CUDA backend context logs hidden to reduce dashboard noise.
-
-## MLflow over reverse SSH (repeatable runbook)
-
-Use this when training runs on a remote host (e.g. `BareMetal`) and MLflow runs on your laptop.
-
-### Required runtime wiring
-
-- OTLP endpoint must be `http://localhost:5000/v1/traces` on the remote training host.
-- MLflow OTLP header must be present: `x-mlflow-experiment-id` (configured in `src/telemetry.rs`).
-- Metrics endpoint is derived automatically from the base URI: `http://localhost:5000/api/2.0/mlflow/runs/log-batch`.
-
-### SSH config (laptop)
-
-Example `~/.ssh/config` entry:
-
-```ssh_config
-Host REMOTE_TRAINING_HOST
-	HostName YOUR_REMOTE_HOST_OR_IP
-	IdentityFile ~/.ssh/YOUR_PRIVATE_KEY
-	User YOUR_REMOTE_USER
-	Port YOUR_SSH_PORT
-	RemoteForward 5000 localhost:5000
-```
-
-### Every-run command order
-
-1) **Laptop / Terminal A**: start MLflow first
-
-```bash
-uv run mlflow server --host 127.0.0.1 --port 5000
-```
-
-2) **Laptop / Terminal B**: keep reverse tunnel open
-
-```bash
-ssh -N BareMetal
-```
-
-Optional debug mode:
-
-```bash
-ssh -vvv -N BareMetal
-```
-
-3) **Remote (`BareMetal`)**: verify tunnel endpoint
-
-```bash
-curl -i http://localhost:5000/
-```
-
-Expected: `HTTP/1.1 200 OK`.
-
-4) **Remote (`BareMetal`)**: run training
-
-```bash
-cargo run --bin ppo -- --config ppo_config.yaml
-cargo run --bin spo -- --config spo_config.yaml
-```
-
-### Quick diagnostics
-
-- `405 Method Not Allowed` at `http://localhost:5000/`:
-	endpoint path is wrong; use `/v1/traces`.
-- `Connection refused` to `http://localhost:5000/v1/traces`:
-	tunnel or local MLflow is down.
-- `ssh -N BareMetal` prints `connect_to localhost port 5000: failed`:
-	local MLflow is not listening yet; start MLflow first, then reconnect SSH.
-
-### Optional direct probe of OTLP route
-
-From `BareMetal`, this checks that POST reaches the traces route and header is accepted:
-
-```bash
-curl -X POST 'http://localhost:5000/v1/traces' \
-	-H 'x-mlflow-experiment-id: 0' \
-	-H 'Content-Type: application/x-protobuf' \
-	--data-binary '' -i
-```
-
-Expected: not `404`/`405`; a `400` with empty payload is acceptable for this probe.
-
-## Maintenance checklist for telemetry changes
-
-When modifying telemetry:
-
-- update both trainer emitters if schema keys are shared,
-- keep category names stable,
-- keep formatter in shared module,
-- update this document and run a quick PPO+SPO smoke check.
+For transport failures, validate tunnel and endpoint path (`/v1/traces`).

@@ -1,12 +1,12 @@
 # Onboarding
 
-Use this guide to get from clean checkout to a reliable PPO/SPO run with the expected telemetry and config semantics.
+Use this guide to get from clean checkout to reliable PPO/SPO runs with current config and telemetry semantics.
 
 ## Local setup
 
 1. Install Rust stable toolchain.
-2. Ensure Python build tooling is present and `python3-config` is in `PATH`.
-3. Ensure sibling `../rustpool` checkout exists (path dependency).
+2. Ensure Python build tooling is present (`python3-config` in `PATH`).
+3. Ensure sibling `../rustpool` checkout exists.
 
 Quick verification:
 
@@ -35,73 +35,51 @@ Expected telemetry categories:
 - `EVALUATOR`
 - `MISC`
 
-## Recommended execution workflow
+## Runtime mental model
 
-1. Build check:
+Both binaries follow:
 
-```bash
-cargo check
-```
+1. load config via dedicated loader (`PpoArgs` / `SpoArgs`)
+2. initialize shared telemetry context (`TrainingContext`)
+3. run trainer wrapper (`PpoTrainer` / `SpoTrainer`)
 
-2. PPO baseline run:
-
-```bash
-cargo run --release -- --config ppo_config.yaml
-```
-
-3. SPO baseline run:
-
-```bash
-cargo run --release --bin spo -- --config spo_config.yaml
-```
-
-4. Override one variable at a time from CLI to isolate effects.
-
-## Shared configuration model
-
-Both binaries use the same config loader and merge path.
+## Shared config model
 
 Precedence:
 
 - code defaults
-- YAML config file
+- YAML config
 - explicit CLI flags
 
 Compatibility:
 
-- canonical section name: `training_core`
-- legacy alias accepted: `ppo_core`
+- canonical section `training_core`
+- legacy alias `ppo_core`
 
-If behavior differs from expected values, inspect merge path in `src/config.rs` before debugging trainers.
+Adapter selection:
+
+- optional `architecture.observation_adapter`
+- metadata fallback when omitted
 
 ## Read order by intent
 
-### If your priority is running experiments
+If your priority is running experiments:
 
 1. [configuration.md](configuration.md)
 2. [telemetry.md](telemetry.md)
 3. [troubleshooting.md](troubleshooting.md)
 
-### If your priority is internal changes
+If your priority is modifying internals:
 
 1. [architecture.md](architecture.md)
 2. [training-loop.md](training-loop.md)
 3. [spo-training-loop.md](spo-training-loop.md)
 4. [telemetry.md](telemetry.md)
 
-## Safety checklist before pushing trainer changes
+## Safety checklist before pushing changes
 
 - `cargo check` passes
-- one PPO smoke run succeeds
-- one SPO smoke run succeeds
-- telemetry categories and eval schema are unchanged unless intentionally migrated
-- config docs/templates were updated if schema keys changed
-
-## Common first-debug path
-
-When a run behaves unexpectedly, inspect in this order:
-
-1. config merge and unknown-field validation (`src/config.rs`)
-2. env routing and snapshot lifecycle (`src/env.rs`)
-3. trainer-specific loop (`src/ppo/train.rs` or `src/spo/train.rs`)
-4. rustpool worker/env semantics (`../rustpool/src/core/worker.rs` and env modules)
+- PPO smoke run succeeds
+- SPO smoke run succeeds
+- shared telemetry categories/evaluator schema preserved unless intentionally changed
+- docs/templates updated with any schema or contract change

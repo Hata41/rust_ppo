@@ -2,6 +2,8 @@ use rand::Rng;
 use rustpool::core::types::GenericObs;
 use std::sync::Arc;
 
+use crate::buffer_common::{flatten_obs_nonempty, BufferStorage};
+
 #[derive(Clone, Debug)]
 pub struct ReplayBatch {
     pub obs: Vec<Arc<GenericObs>>,
@@ -308,21 +310,16 @@ impl ReplayBuffer {
     }
 }
 
-pub fn flatten_obs_once(obs: &GenericObs) -> anyhow::Result<Vec<f32>> {
-    let mut out = Vec::new();
-    for array in obs {
-        match array {
-            rustpool::core::types::ArrayData::Float32(values) => out.extend_from_slice(values),
-            rustpool::core::types::ArrayData::Int32(values) => {
-                out.extend(values.iter().map(|v| *v as f32));
-            }
-            rustpool::core::types::ArrayData::Bool(values) => {
-                out.extend(values.iter().map(|v| if *v { 1.0 } else { 0.0 }));
-            }
+impl BufferStorage for ReplayBuffer {
+    fn len(&self) -> usize {
+        if self.is_full {
+            self.add_batch_size * self.max_length_time_axis
+        } else {
+            self.add_batch_size * self.current_index
         }
     }
-    if out.is_empty() {
-        anyhow::bail!("observation flatten produced empty vector");
-    }
-    Ok(out)
+}
+
+pub fn flatten_obs_once(obs: &GenericObs) -> anyhow::Result<Vec<f32>> {
+    flatten_obs_nonempty(obs)
 }

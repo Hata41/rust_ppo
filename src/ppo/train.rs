@@ -1,121 +1,293 @@
 use anyhow::{bail, Result};
-use burn::module::{Module, ModuleVisitor, Param};
 use burn::optim::{AdamConfig, GradientsParams, Optimizer};
 use burn::tensor::backend::AutodiffBackend;
 use burn::tensor::Int;
-use burn::tensor::{ElementConversion, Tensor, TensorData};
+use burn::tensor::{Tensor, TensorData};
 use rand::seq::SliceRandom;
 use rand::{rngs::StdRng, SeedableRng};
 use std::collections::VecDeque;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, span, Level};
 
 use crate::config::{Args, DistInfo};
 use crate::env::{make_env, AsyncEnvPool};
 use crate::env_model::{
-    build_actor_input_batch, build_critic_input_batch, build_policy_input_batch,
-    build_policy_input_from_binpack_parts, detect_env_model_from_metadata, infer_obs_dim,
-    EnvModelKind,
+    ObservationAdapter, resolve_observation_adapter,
 };
+use crate::evaluation::{run_eval_with_policy, EvalStats};
 use crate::models::{Actor, Agent, Critic, PolicyInput};
 use crate::ppo::buffer::{flatten_obs_into, Rollout};
 use crate::ppo::loss::{
     compute_ppo_losses, logprob_and_entropy, masked_logits, sample_actions_categorical,
 };
+use crate::telemetry::TrainingContext;
+use crate::training_utils::{clip_global_grad_norm, linear_decay_alpha};
 
-fn linear_decay_alpha(update: usize, num_updates: usize) -> f64 {
-    if num_updates == 0 {
-        return 1.0;
-    }
-    let progress = (update as f64) / (num_updates as f64);
-    1.0 - progress
+struct PpoOptimizationSummary {
+    elapsed: Duration,
+    actor_loss_sum: f64,
+    critic_loss_sum: f64,
+    entropy_sum: f64,
+    grad_norm_sum: f64,
+    data_prep_duration_ms: f64,
+    forward_loss_duration_ms: f64,
+    backward_step_duration_ms: f64,
 }
 
-struct GradSqAccumulator<'a> {
-    grads: &'a GradientsParams,
-    sum_sq: f64,
-}
+struct PpoOptimizer;
 
-impl<'a> GradSqAccumulator<'a> {
-    fn new(grads: &'a GradientsParams) -> Self {
-        Self { grads, sum_sq: 0.0 }
-    }
-}
+impl PpoOptimizer {
+    #[allow(clippy::too_many_arguments)]
+    fn optimize_update<B: AutodiffBackend>(
+        roll: &Rollout,
+        is_binpack: bool,
+        local_batch: usize,
+        obs_dim: usize,
+        action_dim: usize,
+        args: &Args,
+        update: usize,
+        is_lead: bool,
+        adapter: &dyn ObservationAdapter<B>,
+        device: &B::Device,
+        rng: &mut StdRng,
+        agent: &mut Agent<B>,
+        actor_optim: &mut impl Optimizer<Actor<B>, B>,
+        critic_optim: &mut impl Optimizer<Critic<B>, B>,
+        current_actor_lr: f64,
+        current_critic_lr: f64,
+    ) -> Result<PpoOptimizationSummary> {
+        let mb_size = local_batch / args.num_minibatches;
+        let mut all_indices: Vec<usize> = (0..local_batch).collect();
 
-impl<Bk: AutodiffBackend> ModuleVisitor<Bk> for GradSqAccumulator<'_> {
-    fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<Bk, D>>) {
-        let id = param.id;
-        if let Some(grad) = self.grads.get::<Bk::InnerBackend, D>(id) {
-            if let Ok(values) = grad.to_data().to_vec::<f32>() {
-                self.sum_sq += values
-                    .iter()
-                    .map(|v| {
-                        let x: f64 = (*v).elem();
-                        x * x
-                    })
-                    .sum::<f64>();
+        let mut actor_loss_acc = Tensor::<B, 1>::zeros([1], device);
+        let mut critic_loss_acc = Tensor::<B, 1>::zeros([1], device);
+        let mut entropy_acc = Tensor::<B, 1>::zeros([1], device);
+        let mut grad_norm_sum = 0.0f64;
+        let mut optimization_data_prep_duration_ms = 0.0f64;
+        let mut optimization_forward_loss_duration_ms = 0.0f64;
+        let mut optimization_backward_step_duration_ms = 0.0f64;
+
+        let optimization_started = Instant::now();
+        {
+            let optimization_span = span!(
+                Level::DEBUG,
+                "optimization_span",
+                update,
+                epochs = args.epochs,
+                num_minibatches = args.num_minibatches,
+                mb_size
+            );
+            let _optimization_guard = optimization_span.enter();
+
+            for epoch in 0..args.epochs {
+                all_indices.shuffle(rng);
+
+                for mb in 0..args.num_minibatches {
+                    let start = mb * mb_size;
+                    let end = start + mb_size;
+                    let mb_idx = &all_indices[start..end];
+
+                    let data_prep_started = Instant::now();
+                    let (logits, act_t, mask_t, old_lp_t, old_v_t, adv_t, tgt_t, v2) = if is_binpack {
+                        let (
+                            items_mb,
+                            ems_mb,
+                            items_valid_mb,
+                            ems_valid_mb,
+                            act_mb,
+                            mask_mb,
+                            old_lp_mb,
+                            old_v_mb,
+                            adv_mb,
+                            tgt_mb,
+                        ) = roll.minibatch_binpack(mb_idx)?;
+
+                        let policy_input = adapter.build_policy_input_from_binpack_parts(
+                            items_mb,
+                            ems_mb,
+                            items_valid_mb,
+                            ems_valid_mb,
+                            mb_size,
+                            args,
+                            device,
+                        )?;
+                        let (logits, v2) = agent.policy_value(policy_input);
+
+                        let act_t = Tensor::<B, 1, Int>::from_data(
+                            TensorData::new(act_mb, [mb_size]),
+                            device,
+                        );
+                        let mask_t = Tensor::<B, 2>::from_data(
+                            TensorData::new(mask_mb, [mb_size, action_dim]),
+                            device,
+                        );
+                        let old_lp_t = Tensor::<B, 1>::from_data(
+                            TensorData::new(old_lp_mb, [mb_size]),
+                            device,
+                        );
+                        let old_v_t = Tensor::<B, 1>::from_data(
+                            TensorData::new(old_v_mb, [mb_size]),
+                            device,
+                        );
+                        let adv_t = Tensor::<B, 1>::from_data(TensorData::new(adv_mb, [mb_size]), device);
+                        let tgt_t = Tensor::<B, 1>::from_data(TensorData::new(tgt_mb, [mb_size]), device);
+
+                        (logits, act_t, mask_t, old_lp_t, old_v_t, adv_t, tgt_t, v2)
+                    } else {
+                        let (obs_mb, act_mb, mask_mb, old_lp_mb, old_v_mb, adv_mb, tgt_mb) =
+                            roll.minibatch(mb_idx);
+
+                        let obs_t = Tensor::<B, 2>::from_data(
+                            TensorData::new(obs_mb, [mb_size, obs_dim]),
+                            device,
+                        );
+                        let act_t = Tensor::<B, 1, Int>::from_data(
+                            TensorData::new(act_mb, [mb_size]),
+                            device,
+                        );
+                        let mask_t = Tensor::<B, 2>::from_data(
+                            TensorData::new(mask_mb, [mb_size, action_dim]),
+                            device,
+                        );
+                        let old_lp_t = Tensor::<B, 1>::from_data(
+                            TensorData::new(old_lp_mb, [mb_size]),
+                            device,
+                        );
+                        let old_v_t = Tensor::<B, 1>::from_data(
+                            TensorData::new(old_v_mb, [mb_size]),
+                            device,
+                        );
+                        let adv_t = Tensor::<B, 1>::from_data(TensorData::new(adv_mb, [mb_size]), device);
+                        let tgt_t = Tensor::<B, 1>::from_data(TensorData::new(tgt_mb, [mb_size]), device);
+
+                        let (logits, v2) = agent.policy_value(PolicyInput::Dense { obs: obs_t });
+
+                        (logits, act_t, mask_t, old_lp_t, old_v_t, adv_t, tgt_t, v2)
+                    };
+                    optimization_data_prep_duration_ms +=
+                        data_prep_started.elapsed().as_secs_f64() * 1_000.0;
+
+                    let forward_loss_started = Instant::now();
+                    let v = v2.reshape([mb_size]);
+
+                    let (new_lp, ent) = logprob_and_entropy::<B>(logits, mask_t, act_t);
+
+                    let parts = compute_ppo_losses::<B>(
+                        new_lp,
+                        old_lp_t,
+                        adv_t,
+                        ent,
+                        v,
+                        old_v_t,
+                        tgt_t,
+                        args.clip_eps,
+                        args.ent_coef,
+                        args.vf_coef,
+                    );
+                    optimization_forward_loss_duration_ms +=
+                        forward_loss_started.elapsed().as_secs_f64() * 1_000.0;
+
+                    let backward_step_started = Instant::now();
+                    let mut grads = parts.total_loss.backward();
+
+                    let mut grads_actor =
+                        GradientsParams::from_module::<B, Actor<B>>(&mut grads, &agent.actor);
+                    let mut grads_critic =
+                        GradientsParams::from_module::<B, Critic<B>>(&mut grads, &agent.critic);
+
+                    let global_grad_norm = clip_global_grad_norm(
+                        &agent.actor,
+                        &agent.critic,
+                        &mut grads_actor,
+                        &mut grads_critic,
+                        args.max_grad_norm,
+                    );
+
+                    agent.actor = actor_optim.step(current_actor_lr, agent.actor.clone(), grads_actor);
+                    agent.critic = critic_optim.step(current_critic_lr, agent.critic.clone(), grads_critic);
+                    optimization_backward_step_duration_ms +=
+                        backward_step_started.elapsed().as_secs_f64() * 1_000.0;
+
+                    actor_loss_acc = actor_loss_acc + parts.actor_loss.clone().detach();
+                    critic_loss_acc = critic_loss_acc + parts.value_loss.clone().detach();
+                    entropy_acc = entropy_acc + parts.entropy_mean.clone().detach();
+                    grad_norm_sum += global_grad_norm as f64;
+
+                    if is_lead {
+                        let actor_loss = parts
+                            .actor_loss
+                            .to_data()
+                            .to_vec::<f32>()
+                            .unwrap_or_default()
+                            .first()
+                            .copied()
+                            .unwrap_or(0.0);
+                        let critic_loss = parts
+                            .value_loss
+                            .to_data()
+                            .to_vec::<f32>()
+                            .unwrap_or_default()
+                            .first()
+                            .copied()
+                            .unwrap_or(0.0);
+                        let entropy = parts
+                            .entropy_mean
+                            .to_data()
+                            .to_vec::<f32>()
+                            .unwrap_or_default()
+                            .first()
+                            .copied()
+                            .unwrap_or(0.0);
+                        debug!(
+                            category = "TRAINER",
+                            update,
+                            epoch,
+                            minibatch = mb,
+                            actor_loss,
+                            critic_loss,
+                            entropy,
+                            global_grad_norm,
+                            learning_rate = current_actor_lr,
+                            "minibatch"
+                        );
+                    }
+                }
             }
         }
+
+        let actor_loss_sum = actor_loss_acc
+            .to_data()
+            .to_vec::<f32>()
+            .unwrap_or_default()
+            .first()
+            .copied()
+            .unwrap_or(0.0) as f64;
+        let critic_loss_sum = critic_loss_acc
+            .to_data()
+            .to_vec::<f32>()
+            .unwrap_or_default()
+            .first()
+            .copied()
+            .unwrap_or(0.0) as f64;
+        let entropy_sum = entropy_acc
+            .to_data()
+            .to_vec::<f32>()
+            .unwrap_or_default()
+            .first()
+            .copied()
+            .unwrap_or(0.0) as f64;
+
+        Ok(PpoOptimizationSummary {
+            elapsed: optimization_started.elapsed(),
+            actor_loss_sum,
+            critic_loss_sum,
+            entropy_sum,
+            grad_norm_sum,
+            data_prep_duration_ms: optimization_data_prep_duration_ms,
+            forward_loss_duration_ms: optimization_forward_loss_duration_ms,
+            backward_step_duration_ms: optimization_backward_step_duration_ms,
+        })
     }
-}
-
-struct GradScaler<'a> {
-    grads: &'a mut GradientsParams,
-    scale: f64,
-}
-
-impl<Bk: AutodiffBackend> ModuleVisitor<Bk> for GradScaler<'_> {
-    fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<Bk, D>>) {
-        let id = param.id;
-        if let Some(grad) = self.grads.remove::<Bk::InnerBackend, D>(id) {
-            self.grads
-                .register::<Bk::InnerBackend, D>(id, grad.mul_scalar(self.scale));
-        }
-    }
-}
-
-fn clip_global_grad_norm<Bk: AutodiffBackend>(
-    actor: &Actor<Bk>,
-    critic: &Critic<Bk>,
-    grads_actor: &mut GradientsParams,
-    grads_critic: &mut GradientsParams,
-    max_grad_norm: f32,
-) -> f32 {
-    let mut actor_acc = GradSqAccumulator::new(grads_actor);
-    <Actor<Bk> as Module<Bk>>::visit(actor, &mut actor_acc);
-
-    let mut critic_acc = GradSqAccumulator::new(grads_critic);
-    <Critic<Bk> as Module<Bk>>::visit(critic, &mut critic_acc);
-
-    let total_norm = (actor_acc.sum_sq + critic_acc.sum_sq).sqrt() as f32;
-    if max_grad_norm > 0.0 && total_norm > max_grad_norm {
-        let scale = (max_grad_norm / (total_norm + 1.0e-6)) as f64;
-
-        let mut actor_scaler = GradScaler {
-            grads: grads_actor,
-            scale,
-        };
-        <Actor<Bk> as Module<Bk>>::visit(actor, &mut actor_scaler);
-
-        let mut critic_scaler = GradScaler {
-            grads: grads_critic,
-            scale,
-        };
-        <Critic<Bk> as Module<Bk>>::visit(critic, &mut critic_scaler);
-    }
-
-    total_norm
-}
-
-#[derive(Debug, Clone, Copy)]
-struct EvalStats {
-    mean_return: f32,
-    max_return: f32,
-    min_return: f32,
-    mean_ep_len: f32,
-    max_ep_len: usize,
-    min_ep_len: usize,
-    episodes: usize,
 }
 
 fn run_deterministic_eval<B: AutodiffBackend>(
@@ -124,125 +296,65 @@ fn run_deterministic_eval<B: AutodiffBackend>(
     eval_seed: u64,
     num_eval_envs: usize,
     num_eval_episodes: usize,
-    model_kind: EnvModelKind,
+    adapter: &dyn ObservationAdapter<B>,
     args: &Args,
     obs_dim: usize,
     action_dim: usize,
     device: &B::Device,
 ) -> Result<EvalStats> {
-    if num_eval_envs == 0 || num_eval_episodes == 0 {
-        return Ok(EvalStats {
-            mean_return: 0.0,
-            max_return: 0.0,
-            min_return: 0.0,
-            mean_ep_len: 0.0,
-            max_ep_len: 0,
-            min_ep_len: 0,
-            episodes: 0,
-        });
-    }
+    run_eval_with_policy(
+        eval_pool,
+        eval_seed,
+        num_eval_envs,
+        num_eval_episodes,
+        |_, cur_steps| {
+            let cur_obs = cur_steps.iter().map(|s| &s.obs).collect::<Vec<_>>();
+            let cur_mask = cur_steps
+                .iter()
+                .map(|s| s.action_mask.as_slice())
+                .collect::<Vec<_>>();
 
-    let reset_out = eval_pool.reset_all(Some(eval_seed))?;
-    let mut cur_obs = reset_out.iter().map(|s| s.obs.clone()).collect::<Vec<_>>();
-    let mut cur_mask = reset_out
-        .iter()
-        .map(|s| s.action_mask.clone())
-        .collect::<Vec<_>>();
-
-    let mut ep_return = vec![0.0f32; num_eval_envs];
-    let mut ep_len = vec![0usize; num_eval_envs];
-    let mut completed_returns = Vec::<f32>::with_capacity(num_eval_episodes);
-    let mut completed_lengths = Vec::<usize>::with_capacity(num_eval_episodes);
-    let base_quota = num_eval_episodes / num_eval_envs;
-    let extra = num_eval_episodes % num_eval_envs;
-    let per_env_quota = (0..num_eval_envs)
-        .map(|env_idx| base_quota + usize::from(env_idx < extra))
-        .collect::<Vec<_>>();
-    let mut per_env_count = vec![0usize; num_eval_envs];
-
-    while completed_returns.len() < num_eval_episodes {
-        let mut mask_f = vec![0.0f32; num_eval_envs * action_dim];
-        for e in 0..num_eval_envs {
-            let row = e * action_dim;
-            for a in 0..action_dim {
-                mask_f[row + a] = if cur_mask[e][a] { 1.0 } else { 0.0 };
-            }
-        }
-        let mask_t =
-            Tensor::<B, 2>::from_data(TensorData::new(mask_f, [num_eval_envs, action_dim]), device);
-
-        let logits = agent
-            .actor_logits(build_actor_input_batch::<B>(
-                &cur_obs, model_kind, args, obs_dim, device,
-            )?)
-            .detach();
-
-        let masked = masked_logits(logits, mask_t);
-        let probs = burn::tensor::activation::softmax(masked, 1);
-        let actions_t = probs.argmax(1).reshape([num_eval_envs]);
-
-        let actions_data = actions_t.to_data();
-        let actions_vec: Vec<i32> = match actions_data.clone().to_vec::<i32>() {
-            Ok(v) => v,
-            Err(_) => actions_data
-                .to_vec::<i64>()
-                .map_err(|e| anyhow::anyhow!("failed to convert greedy actions: {e:?}"))?
-                .into_iter()
-                .map(|v| v as i32)
-                .collect(),
-        };
-
-        let step_out = eval_pool.step_all(&actions_vec)?;
-
-        for e in 0..num_eval_envs {
-            ep_return[e] += step_out[e].reward;
-            ep_len[e] += 1;
-
-            if step_out[e].done {
-                if completed_returns.len() < num_eval_episodes
-                    && per_env_count[e] < per_env_quota[e]
-                {
-                    completed_returns.push(ep_return[e]);
-                    completed_lengths.push(ep_len[e]);
-                    per_env_count[e] += 1;
+            let mut mask_f = vec![0.0f32; num_eval_envs * action_dim];
+            for e in 0..num_eval_envs {
+                let row = e * action_dim;
+                for a in 0..action_dim {
+                    mask_f[row + a] = if cur_mask[e][a] { 1.0 } else { 0.0 };
                 }
-                ep_return[e] = 0.0;
-                ep_len[e] = 0;
             }
-        }
+            let mask_t = Tensor::<B, 2>::from_data(
+                TensorData::new(mask_f, [num_eval_envs, action_dim]),
+                device,
+            );
 
-        for e in 0..num_eval_envs {
-            cur_obs[e].clone_from(&step_out[e].obs);
-            cur_mask[e].clone_from(&step_out[e].action_mask);
-        }
-    }
+            let logits = agent
+                .actor_logits(adapter.build_actor_input_batch(&cur_obs, args, obs_dim, device)?)
+                .detach();
 
-    let episodes = completed_returns.len();
-    let mean_return = completed_returns.iter().sum::<f32>() / (episodes as f32);
-    let max_return = completed_returns
-        .iter()
-        .copied()
-        .fold(f32::NEG_INFINITY, f32::max);
-    let min_return = completed_returns
-        .iter()
-        .copied()
-        .fold(f32::INFINITY, f32::min);
-    let mean_ep_len = completed_lengths.iter().map(|v| *v as f32).sum::<f32>() / (episodes as f32);
-    let max_ep_len = *completed_lengths.iter().max().unwrap_or(&0);
-    let min_ep_len = *completed_lengths.iter().min().unwrap_or(&0);
+            let masked = masked_logits(logits, mask_t);
+            let probs = burn::tensor::activation::softmax(masked, 1);
+            let actions_t = probs.argmax(1).reshape([num_eval_envs]);
 
-    Ok(EvalStats {
-        mean_return,
-        max_return,
-        min_return,
-        mean_ep_len,
-        max_ep_len,
-        min_ep_len,
-        episodes,
-    })
+            let actions_data = actions_t.to_data();
+            let actions_vec: Vec<i32> = match actions_data.clone().to_vec::<i32>() {
+                Ok(v) => v,
+                Err(_) => actions_data
+                    .to_vec::<i64>()
+                    .map_err(|e| anyhow::anyhow!("failed to convert greedy actions: {e:?}"))?
+                    .into_iter()
+                    .map(|v| v as i32)
+                    .collect(),
+            };
+
+            Ok(actions_vec)
+        },
+    )
 }
 
-pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) -> Result<()> {
+fn run_loop<B: AutodiffBackend>(
+    args: Args,
+    dist: DistInfo,
+    device: B::Device,
+) -> Result<()> {
     let is_lead = dist.rank == 0;
 
     if args.num_envs == 0 {
@@ -262,7 +374,7 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
     B::seed(&device, args.seed);
 
     let model_probe = make_env(&args.task_id, &args, args.seed)?;
-    let model_kind = detect_env_model_from_metadata(&*model_probe);
+    let adapter = resolve_observation_adapter::<B>(&*model_probe, &args);
 
     let env_pool = AsyncEnvPool::new(local_num_envs, args.seed, {
         let args = args.clone();
@@ -276,9 +388,9 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
         .map(|s| s.action_mask.clone())
         .collect::<Vec<_>>();
 
-    let is_binpack = model_kind == EnvModelKind::BinPackStructured;
+    let is_binpack = adapter.uses_binpack_architecture();
 
-    let obs_dim = infer_obs_dim(&cur_obs[0], model_kind, &args);
+    let obs_dim = adapter.infer_obs_dim(&cur_obs[0], &args);
     let action_dim = cur_mask[0].len();
 
     if is_lead {
@@ -296,7 +408,13 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
         );
     }
 
-    let mut agent: Agent<B> = Agent::new(obs_dim, args.hidden_dim, action_dim, &device);
+    let mut agent: Agent<B> = Agent::new(
+        obs_dim,
+        args.hidden_dim,
+        action_dim,
+        is_binpack,
+        &device,
+    );
 
     let mut actor_optim = AdamConfig::new().init::<B, Actor<B>>();
     let mut critic_optim = AdamConfig::new().init::<B, Critic<B>>();
@@ -396,9 +514,10 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                 }
 
                 let rollout_model_started = Instant::now();
-                let (logits, values2) = agent.policy_value(build_policy_input_batch::<B>(
-                    &cur_obs, model_kind, &args, obs_dim, &device,
-                )?);
+                let cur_obs_refs = cur_obs.iter().collect::<Vec<_>>();
+                let (logits, values2) = agent.policy_value(
+                    adapter.build_policy_input_batch(&cur_obs_refs, &args, obs_dim, &device)?,
+                );
                 let (logits, values2) = (logits.detach(), values2.detach());
                 let values = values2.reshape([local_num_envs]);
 
@@ -491,10 +610,9 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
         let rollout_elapsed = rollout_started.elapsed();
 
         let last_v2 = if is_binpack {
+            let cur_obs_refs = cur_obs.iter().collect::<Vec<_>>();
             agent
-                .critic_values(build_critic_input_batch::<B>(
-                    &cur_obs, model_kind, &args, obs_dim, &device,
-                )?)
+                .critic_values(adapter.build_critic_input_batch(&cur_obs_refs, &args, obs_dim, &device)?)
                 .detach()
         } else {
             let obs_last = Tensor::<B, 2>::from_data(
@@ -515,241 +633,36 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
             args.standardize_advantages,
         );
 
-        let mb_size = local_batch / args.num_minibatches;
-        let mut all_indices: Vec<usize> = (0..local_batch).collect();
-
-        // Keep scalar metric accumulation on device and fetch once per update.
-        // This reduces minibatch-level host/device synchronization overhead.
-        let mut actor_loss_acc = Tensor::<B, 1>::zeros([1], &device);
-        let mut critic_loss_acc = Tensor::<B, 1>::zeros([1], &device);
-        let mut entropy_acc = Tensor::<B, 1>::zeros([1], &device);
-        let mut grad_norm_sum = 0.0f64;
-        let mut optimization_data_prep_duration_ms = 0.0f64;
-        let mut optimization_forward_loss_duration_ms = 0.0f64;
-        let mut optimization_backward_step_duration_ms = 0.0f64;
-
-        let optimization_started = Instant::now();
-        {
-            let optimization_span = span!(
-                Level::DEBUG,
-                "optimization_span",
-                update,
-                epochs = args.epochs,
-                num_minibatches = args.num_minibatches,
-                mb_size
-            );
-            let _optimization_guard = optimization_span.enter();
-
-            for epoch in 0..args.epochs {
-                all_indices.shuffle(&mut rng);
-
-                for mb in 0..args.num_minibatches {
-                    let start = mb * mb_size;
-                    let end = start + mb_size;
-                    let mb_idx = &all_indices[start..end];
-
-                    let data_prep_started = Instant::now();
-                    let (logits, act_t, mask_t, old_lp_t, old_v_t, adv_t, tgt_t, v2) = if is_binpack
-                    {
-                        let (
-                            items_mb,
-                            ems_mb,
-                            items_valid_mb,
-                            ems_valid_mb,
-                            act_mb,
-                            mask_mb,
-                            old_lp_mb,
-                            old_v_mb,
-                            adv_mb,
-                            tgt_mb,
-                        ) = roll.minibatch_binpack(mb_idx)?;
-
-                        let policy_input = build_policy_input_from_binpack_parts::<B>(
-                            items_mb,
-                            ems_mb,
-                            items_valid_mb,
-                            ems_valid_mb,
-                            mb_size,
-                            &args,
-                            &device,
-                        );
-                        let (logits, v2) = agent.policy_value(policy_input);
-
-                        let act_t = Tensor::<B, 1, Int>::from_data(
-                            TensorData::new(act_mb, [mb_size]),
-                            &device,
-                        );
-                        let mask_t = Tensor::<B, 2>::from_data(
-                            TensorData::new(mask_mb, [mb_size, action_dim]),
-                            &device,
-                        );
-                        let old_lp_t = Tensor::<B, 1>::from_data(
-                            TensorData::new(old_lp_mb, [mb_size]),
-                            &device,
-                        );
-                        let old_v_t = Tensor::<B, 1>::from_data(
-                            TensorData::new(old_v_mb, [mb_size]),
-                            &device,
-                        );
-                        let adv_t =
-                            Tensor::<B, 1>::from_data(TensorData::new(adv_mb, [mb_size]), &device);
-                        let tgt_t =
-                            Tensor::<B, 1>::from_data(TensorData::new(tgt_mb, [mb_size]), &device);
-
-                        (logits, act_t, mask_t, old_lp_t, old_v_t, adv_t, tgt_t, v2)
-                    } else {
-                        let (obs_mb, act_mb, mask_mb, old_lp_mb, old_v_mb, adv_mb, tgt_mb) =
-                            roll.minibatch(mb_idx);
-
-                        let obs_t = Tensor::<B, 2>::from_data(
-                            TensorData::new(obs_mb, [mb_size, obs_dim]),
-                            &device,
-                        );
-                        let act_t = Tensor::<B, 1, Int>::from_data(
-                            TensorData::new(act_mb, [mb_size]),
-                            &device,
-                        );
-                        let mask_t = Tensor::<B, 2>::from_data(
-                            TensorData::new(mask_mb, [mb_size, action_dim]),
-                            &device,
-                        );
-                        let old_lp_t = Tensor::<B, 1>::from_data(
-                            TensorData::new(old_lp_mb, [mb_size]),
-                            &device,
-                        );
-                        let old_v_t = Tensor::<B, 1>::from_data(
-                            TensorData::new(old_v_mb, [mb_size]),
-                            &device,
-                        );
-                        let adv_t =
-                            Tensor::<B, 1>::from_data(TensorData::new(adv_mb, [mb_size]), &device);
-                        let tgt_t =
-                            Tensor::<B, 1>::from_data(TensorData::new(tgt_mb, [mb_size]), &device);
-
-                        let (logits, v2) = agent.policy_value(PolicyInput::Dense { obs: obs_t });
-
-                        (logits, act_t, mask_t, old_lp_t, old_v_t, adv_t, tgt_t, v2)
-                    };
-                    optimization_data_prep_duration_ms +=
-                        data_prep_started.elapsed().as_secs_f64() * 1_000.0;
-
-                    let forward_loss_started = Instant::now();
-                    let v = v2.reshape([mb_size]);
-
-                    let (new_lp, ent) = logprob_and_entropy::<B>(logits, mask_t, act_t);
-
-                    let parts = compute_ppo_losses::<B>(
-                        new_lp,
-                        old_lp_t,
-                        adv_t,
-                        ent,
-                        v,
-                        old_v_t,
-                        tgt_t,
-                        args.clip_eps,
-                        args.ent_coef,
-                        args.vf_coef,
-                    );
-                    optimization_forward_loss_duration_ms +=
-                        forward_loss_started.elapsed().as_secs_f64() * 1_000.0;
-
-                    let backward_step_started = Instant::now();
-                    let mut grads = parts.total_loss.backward();
-
-                    let mut grads_actor =
-                        GradientsParams::from_module::<B, Actor<B>>(&mut grads, &agent.actor);
-                    let mut grads_critic =
-                        GradientsParams::from_module::<B, Critic<B>>(&mut grads, &agent.critic);
-
-                    let global_grad_norm = clip_global_grad_norm(
-                        &agent.actor,
-                        &agent.critic,
-                        &mut grads_actor,
-                        &mut grads_critic,
-                        args.max_grad_norm,
-                    );
-
-                    agent.actor = actor_optim.step(current_actor_lr, agent.actor, grads_actor);
-                    agent.critic = critic_optim.step(current_critic_lr, agent.critic, grads_critic);
-                    optimization_backward_step_duration_ms +=
-                        backward_step_started.elapsed().as_secs_f64() * 1_000.0;
-
-                    actor_loss_acc = actor_loss_acc + parts.actor_loss.clone().detach();
-                    critic_loss_acc = critic_loss_acc + parts.value_loss.clone().detach();
-                    entropy_acc = entropy_acc + parts.entropy_mean.clone().detach();
-                    grad_norm_sum += global_grad_norm as f64;
-
-                    if is_lead {
-                        let actor_loss = parts
-                            .actor_loss
-                            .to_data()
-                            .to_vec::<f32>()
-                            .unwrap_or_default()
-                            .first()
-                            .copied()
-                            .unwrap_or(0.0);
-                        let critic_loss = parts
-                            .value_loss
-                            .to_data()
-                            .to_vec::<f32>()
-                            .unwrap_or_default()
-                            .first()
-                            .copied()
-                            .unwrap_or(0.0);
-                        let entropy = parts
-                            .entropy_mean
-                            .to_data()
-                            .to_vec::<f32>()
-                            .unwrap_or_default()
-                            .first()
-                            .copied()
-                            .unwrap_or(0.0);
-                        debug!(
-                            category = "TRAINER",
-                            update,
-                            epoch,
-                            minibatch = mb,
-                            actor_loss,
-                            critic_loss,
-                            entropy,
-                            global_grad_norm,
-                            learning_rate = current_actor_lr,
-                            "minibatch"
-                        );
-                    }
-                }
-            }
-        }
-        let optimization_elapsed = optimization_started.elapsed();
+        let optimization_summary = PpoOptimizer::optimize_update(
+            &roll,
+            is_binpack,
+            local_batch,
+            obs_dim,
+            action_dim,
+            &args,
+            update,
+            is_lead,
+            adapter.as_ref(),
+            &device,
+            &mut rng,
+            &mut agent,
+            &mut actor_optim,
+            &mut critic_optim,
+            current_actor_lr,
+            current_critic_lr,
+        )?;
+        let optimization_elapsed = optimization_summary.elapsed;
 
         if is_lead {
             let num_updates_in_cycle = (args.epochs * args.num_minibatches) as f64;
             let denom = num_updates_in_cycle.max(1.0);
-            let actor_loss_sum = actor_loss_acc
-                .to_data()
-                .to_vec::<f32>()
-                .unwrap_or_default()
-                .first()
-                .copied()
-                .unwrap_or(0.0) as f64;
-            let critic_loss_sum = critic_loss_acc
-                .to_data()
-                .to_vec::<f32>()
-                .unwrap_or_default()
-                .first()
-                .copied()
-                .unwrap_or(0.0) as f64;
-            let entropy_sum = entropy_acc
-                .to_data()
-                .to_vec::<f32>()
-                .unwrap_or_default()
-                .first()
-                .copied()
-                .unwrap_or(0.0) as f64;
+            let actor_loss_sum = optimization_summary.actor_loss_sum;
+            let critic_loss_sum = optimization_summary.critic_loss_sum;
+            let entropy_sum = optimization_summary.entropy_sum;
             let mean_actor_loss = actor_loss_sum / denom;
             let mean_critic_loss = critic_loss_sum / denom;
             let mean_entropy = entropy_sum / denom;
-            let mean_global_grad_norm = grad_norm_sum / denom;
+            let mean_global_grad_norm = optimization_summary.grad_norm_sum / denom;
 
             let mean_return = if recent_returns.is_empty() {
                 0.0
@@ -834,9 +747,9 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                 rollout_env_step_duration_ms,
                 rollout_store_duration_ms,
                 optimization_duration_ms = optimization_elapsed.as_secs_f64() * 1_000.0,
-                optimization_data_prep_duration_ms,
-                optimization_forward_loss_duration_ms,
-                optimization_backward_step_duration_ms,
+                optimization_data_prep_duration_ms = optimization_summary.data_prep_duration_ms,
+                optimization_forward_loss_duration_ms = optimization_summary.forward_loss_duration_ms,
+                optimization_backward_step_duration_ms = optimization_summary.backward_step_duration_ms,
                 advantage_pre_mean = adv_stats.pre_mean,
                 advantage_pre_std = adv_stats.pre_std,
                 advantage_post_mean = adv_stats.post_mean,
@@ -858,7 +771,7 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                     args.seed.wrapping_add(999).wrapping_add(update as u64),
                     eval_num_envs,
                     args.num_eval_episodes,
-                    model_kind,
+                    adapter.as_ref(),
                     &args,
                     obs_dim,
                     action_dim,
@@ -885,4 +798,35 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
     }
 
     Ok(())
+}
+
+pub struct PpoTrainer<'a, B: AutodiffBackend> {
+    args: Args,
+    dist: DistInfo,
+    _context: &'a TrainingContext,
+    device: B::Device,
+}
+
+impl<'a, B: AutodiffBackend> PpoTrainer<'a, B> {
+    pub fn new(args: Args, dist: DistInfo, context: &'a TrainingContext, device: B::Device) -> Self {
+        Self {
+            args,
+            dist,
+            _context: context,
+            device,
+        }
+    }
+
+    pub fn run(self) -> Result<()> {
+        run_loop::<B>(self.args, self.dist, self.device)
+    }
+}
+
+pub fn run<B: AutodiffBackend>(
+    args: Args,
+    dist: DistInfo,
+    context: &TrainingContext,
+    device: B::Device,
+) -> Result<()> {
+    PpoTrainer::<B>::new(args, dist, context, device).run()
 }

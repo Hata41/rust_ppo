@@ -3,6 +3,7 @@ use crossbeam_channel::{unbounded, Receiver, Sender};
 use rayon::prelude::*;
 use rustpool::core::mcts::StateRegistry;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Mutex;
 use std::thread;
@@ -14,6 +15,43 @@ use rustpool::envs::binpack::{BinPackConfig, BinPackEnv, RewardFnType};
 use rustpool::envs::maze::{MazeConfig, MazeEnv};
 
 use crate::config::Args;
+
+type EnvFactory = Arc<dyn Fn(&Args, u64) -> Result<Box<dyn RlEnv>> + Send + Sync + 'static>;
+
+#[derive(Default)]
+struct EnvRegistry {
+    factories: HashMap<String, EnvFactory>,
+}
+
+impl EnvRegistry {
+    fn with_builtins() -> Self {
+        let mut registry = Self::default();
+        registry.insert("Maze-v0", Arc::new(make_maze_env));
+        registry.insert("BinPack-v0", Arc::new(make_binpack_env));
+        registry
+    }
+
+    fn insert(&mut self, task_id: impl Into<String>, factory: EnvFactory) {
+        self.factories.insert(task_id.into(), factory);
+    }
+
+    fn get(&self, task_id: &str) -> Option<EnvFactory> {
+        self.factories.get(task_id).cloned()
+    }
+}
+
+fn env_registry() -> &'static Mutex<EnvRegistry> {
+    static REGISTRY: OnceLock<Mutex<EnvRegistry>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(EnvRegistry::with_builtins()))
+}
+
+pub fn register_env_factory(
+    task_id: impl Into<String>,
+    factory: impl Fn(&Args, u64) -> Result<Box<dyn RlEnv>> + Send + Sync + 'static,
+) {
+    let mut registry = env_registry().lock().expect("env registry mutex poisoned");
+    registry.insert(task_id, Arc::new(factory));
+}
 
 #[derive(Clone, Debug)]
 pub struct StepOut {
@@ -417,25 +455,32 @@ impl Drop for AsyncEnvPool {
 }
 
 pub fn make_env(task_id: &str, args: &Args, seed: u64) -> Result<Box<dyn RlEnv>> {
-    match task_id {
-        "Maze-v0" => {
-            let cfg = MazeConfig {
-                width: 10,
-                height: 10,
-                max_episode_steps: args.max_episode_steps as i32,
-            };
-            Ok(Box::new(MazeEnv::new(cfg, seed)))
-        }
-        "BinPack-v0" => {
-            let cfg = BinPackConfig {
-                max_items: args.max_items,
-                max_ems: args.max_ems,
-                split_eps: 0.001,
-                prob_split_one_item: 0.3,
-                split_num_same_items: 1,
-            };
-            Ok(Box::new(BinPackEnv::new(cfg, seed, RewardFnType::Dense)))
-        }
-        other => bail!("unknown task_id: {other}"),
+    let factory = {
+        let registry = env_registry().lock().expect("env registry mutex poisoned");
+        registry.get(task_id)
+    };
+    match factory {
+        Some(factory) => factory(args, seed),
+        None => bail!("unknown task_id: {task_id}"),
     }
+}
+
+fn make_maze_env(args: &Args, seed: u64) -> Result<Box<dyn RlEnv>> {
+    let cfg = MazeConfig {
+        width: 10,
+        height: 10,
+        max_episode_steps: args.max_episode_steps as i32,
+    };
+    Ok(Box::new(MazeEnv::new(cfg, seed)))
+}
+
+fn make_binpack_env(args: &Args, seed: u64) -> Result<Box<dyn RlEnv>> {
+    let cfg = BinPackConfig {
+        max_items: args.max_items,
+        max_ems: args.max_ems,
+        split_eps: 0.001,
+        prob_split_one_item: 0.3,
+        split_num_same_items: 1,
+    };
+    Ok(Box::new(BinPackEnv::new(cfg, seed, RewardFnType::Dense)))
 }

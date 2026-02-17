@@ -1,11 +1,11 @@
 # Architecture
 
-This document defines crate boundaries, dependency direction, and cross-module contracts for both algorithms:
+This document defines crate boundaries, dependency direction, and cross-module contracts for both binaries:
 
-- PPO (`ppo` binary)
-- SPO (`spo` binary)
+- PPO (`ppo`)
+- SPO (`spo`)
 
-For runtime step-by-step execution details, see:
+For runtime step-by-step behavior, see:
 
 - PPO: [training-loop.md](training-loop.md)
 - SPO: [spo-training-loop.md](spo-training-loop.md)
@@ -15,10 +15,12 @@ For runtime step-by-step execution details, see:
 ### `rust_rl` responsibilities
 
 - Config parsing and precedence merge
+- Per-binary config loaders (`PpoArgs`, `SpoArgs`)
 - Environment process orchestration via `AsyncEnvPool`
-- PPO and SPO training loops
-- Shared model-input adaptation (`env_model`)
-- Shared telemetry formatting
+- PPO and SPO trainers + optimizer phases
+- Trait-based observation adaptation (`ObservationAdapter`)
+- Shared deterministic evaluator
+- Shared telemetry context and formatter
 - Snapshot lifecycle accounting at trainer-side pool boundary
 
 ### `rustpool` responsibilities
@@ -36,13 +38,16 @@ Boundary rule:
 
 Core modules in `rust_rl`:
 
-- `src/bin/ppo.rs`: PPO process bootstrap + backend setup
-- `src/bin/spo.rs`: SPO process bootstrap + backend setup
-- `src/config.rs`: shared args schema and YAML/CLI merge logic
-- `src/env.rs`: async env pool, worker routing, snapshot lifecycle integration
-- `src/env_model.rs`: shared observation-to-model adapter for PPO and SPO
-- `src/models.rs`: actor/critic definitions and typed input dispatch
-- `src/telemetry.rs`: shared dashboard formatter + metric registry
+- `src/bin/ppo.rs`: PPO bootstrap + backend selection + `TrainingContext` init
+- `src/bin/spo.rs`: SPO bootstrap + backend selection + `TrainingContext` init
+- `src/config.rs`: shared schema + YAML/CLI merge + per-binary loaders
+- `src/env.rs`: async env pool, worker routing, snapshot lifecycle integration, env registry
+- `src/env_model.rs`: trait-based observation adapters (`DenseObservationAdapter`, `BinPackObservationAdapter`)
+- `src/models.rs`: actor/critic definitions and architecture-aware construction
+- `src/evaluation.rs`: shared evaluation loop scaffold
+- `src/training_utils.rs`: shared LR decay + gradient clipping helpers
+- `src/buffer_common.rs`: shared buffer flattening/storage helpers
+- `src/telemetry.rs`: shared formatter/MLflow/OTLP wiring and `TrainingContext`
 - `src/ppo/*`: PPO-specific buffer/loss/training
 - `src/spo/*`: SPO-specific search/buffer/loss/training
 
@@ -64,6 +69,15 @@ flowchart TD
     TPPO --> MOD[src/models.rs]
     TSPO --> MOD
 
+    TPPO --> EV[src/evaluation.rs]
+    TSPO --> EV
+
+    TPPO --> TU[src/training_utils.rs]
+    TSPO --> TU
+
+    TPPO --> BC[src/buffer_common.rs]
+    TSPO --> BC
+
     TPPO --> LPPO[src/ppo/loss.rs]
     TPPO --> BPPO[src/ppo/buffer.rs]
 
@@ -77,45 +91,49 @@ flowchart TD
     ENV --> RP[rustpool worker/env/state registry]
 ```
 
-## Shared configuration schema contract
+## Configuration contract
 
-Both binaries consume the same deserialized file schema (`FileConfig`) and merge path in `Args::load`.
+Both binaries deserialize the same schema (`FileConfig`) but load through dedicated wrappers:
 
-Key compatibility point:
+- `PpoArgs::load()`
+- `SpoArgs::load()`
+
+Compatibility points:
 
 - Canonical section name: `training_core`
 - Backward-compatible alias: `ppo_core`
+- Optional explicit adapter key: `architecture.observation_adapter`
 
-Design intent:
+PPO decoupling rule:
 
-- One schema path keeps operational ergonomics consistent across algorithms.
-- Algorithm-specific keys are grouped (`spo`) while shared operational keys remain centralized.
+- PPO loader strips `spo` section before strict deserialization so PPO runtime does not implicitly depend on SPO-only config payloads.
 
-See [configuration.md](configuration.md).
+## Observation adapter contract (`env_model`)
 
-## Shared model adapter contract (`env_model`)
-
-`src/env_model.rs` is a central contract to avoid duplicating environment-specific tensor assembly across PPO and SPO.
+`src/env_model.rs` is the shared tensor-construction boundary for PPO/SPO/search.
 
 Responsibilities:
 
-- Detect env model kind from metadata (`EnvModelKind`)
+- Resolve adapter from config (`observation_adapter`) with metadata fallback
 - Infer effective observation dimension
 - Build actor/critic/policy inputs from `GenericObs` batches
 - Build BinPack policy input from PPO minibatch parts
+- Signal architecture needs (`uses_binpack_architecture`)
 
 Invariants:
 
 - Adapter output must match input enums in `models.rs`.
-- Observation parsing assumptions must remain aligned with rustpool env output keys/order.
+- BinPack item/EMS tensor shapes must remain unchanged.
+- Observation parsing assumptions must remain aligned with rustpool output.
 
-Change-impact rule:
+## Environment registry contract
 
-- Any change in rustpool observation schema must be reflected in adapter + trainers together.
+`src/env.rs` now uses a registry pattern instead of hardcoded task matching.
+
+- Built-ins are registered at startup (`Maze-v0`, `BinPack-v0`).
+- New tasks can be added via `register_env_factory(...)` without modifying core switch logic.
 
 ## Snapshot lifecycle and ownership boundary
-
-Snapshot lifecycle involves both crates but has strict ownership split.
 
 Flow:
 
@@ -124,18 +142,14 @@ Flow:
 3. Callers release state ids with `release_batch`.
 4. Pool drop performs final release for any locally tracked ids.
 
-Critical ownership contract:
+Ownership contract:
 
 - `StateRegistry` stores/removes cloned states.
 - `AsyncEnvPool` tracks active state ids locally and guarantees counter/accounting correctness.
 
-Why this matters:
-
-- Prevents underflow/double-release accounting bugs while keeping rustpool APIs unchanged.
-
 ## Telemetry architecture
 
-Both binaries initialize the same dashboard formatter from `src/telemetry.rs`.
+Both binaries initialize telemetry through `TrainingContext::initialize(...)`.
 
 Shared categories:
 
@@ -144,28 +158,13 @@ Shared categories:
 - `EVALUATOR`
 - `MISC`
 
-PPO and SPO emit compatible evaluation schema keys for log consumers.
+PPO and SPO emit compatible evaluation schema keys for downstream dashboards.
 
-See [telemetry.md](telemetry.md).
-
-## Data contracts at algorithm boundaries
-
-### PPO contracts
-
-- Rollout tensor geometry + minibatch extraction in `src/ppo/buffer.rs`
-- PPO loss and sampling in `src/ppo/loss.rs`
-
-### SPO contracts
-
-- Search output semantics (`root_actions`, `root_action_weights`, `leaf_state_ids`) in `src/spo/search.rs`
-- Replay contract storing raw observations + masks + search action weights in `src/spo/buffer.rs`
-- MPO dual and critic target construction in `src/spo/loss.rs` and `src/spo/train.rs`
-
-## Architectural maintenance checklist
+## Maintenance checklist
 
 When modifying internals:
 
-- If you change env observation schema, update `env_model`, PPO/SPO parsing assumptions, and docs.
-- If you change snapshot lifecycle calls, validate accounting ownership remains in `rust_rl`.
-- If you change logging keys/categories, maintain PPO/SPO schema compatibility.
-- If you add config keys, update `src/config.rs` and docs/template comments together.
+- If env observation schema changes, update adapter implementations, trainers, search path, and docs together.
+- If snapshot lifecycle calls change, verify accounting ownership remains in `rust_rl`.
+- If logging keys/categories change, maintain PPO/SPO schema compatibility.
+- If config keys change, update `src/config.rs`, template YAML files, and docs together.

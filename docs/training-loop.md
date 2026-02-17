@@ -1,96 +1,60 @@
 # PPO Training Loop
 
-This page explains PPO runtime behavior: update order, seeding, rollout/eval semantics, and where to edit specific behavior.
-For static module dependencies and data contracts, see [Architecture](architecture.md).
-For SPO runtime internals, see [spo-training-loop.md](spo-training-loop.md).
+This page documents PPO runtime behavior after modular refactor.
+
+For static boundaries, see [architecture.md](architecture.md).
+For SPO runtime, see [spo-training-loop.md](spo-training-loop.md).
 
 ## Runtime sequence
 
-`src/bin/ppo.rs` -> `train::run` -> `AsyncEnvPool` / `Rollout` / `Agent` / PPO losses.
+`src/bin/ppo.rs` -> `PpoArgs::load` -> `TrainingContext::initialize` -> `PpoTrainer::run`.
 
-Direct links:
+Core flow per update:
 
-- Entrypoint and run dispatch: [src/bin/ppo.rs](../src/bin/ppo.rs)
-- Training orchestrator: [src/ppo/train.rs](../src/ppo/train.rs#L325)
-- Environment layer: [src/env.rs](../src/env.rs#L32)
-- Rollout storage: [src/ppo/buffer.rs](../src/ppo/buffer.rs#L167)
-- Model forward path: [src/models.rs](../src/models.rs#L402)
-- Loss path: [src/ppo/loss.rs](../src/ppo/loss.rs#L1)
+1. rollout collection on `AsyncEnvPool`
+2. typed observation adaptation via `ObservationAdapter`
+3. action sampling + logprob collection
+4. rollout storage (`Rollout`)
+5. GAE/targets
+6. optimization phase (`PpoOptimizer`)
+7. telemetry emit
+8. optional deterministic evaluation through shared `evaluation` module
 
-Inside one update, the effective sequence is:
+## Key components
 
-1. env step/reset via `AsyncEnvPool`
-2. observation conversion (`flatten_obs` or BinPack parse)
-3. actor/critic forward (`PolicyInput`)
-4. action sampling + logprob
-5. rollout store
-6. GAE + target computation
-7. minibatch tensor assembly
-8. PPO losses + backward + optimizer step
-9. telemetry + optional deterministic eval
+- Entrypoint: `src/bin/ppo.rs`
+- Trainer wrapper: `src/ppo/train.rs` (`PpoTrainer`)
+- Optimizer phase: `src/ppo/train.rs` (`PpoOptimizer`)
+- Shared evaluator: `src/evaluation.rs`
+- Observation adapter: `src/env_model.rs`
+- Rollout buffer: `src/ppo/buffer.rs`
+- PPO losses: `src/ppo/loss.rs`
 
-Performance note:
+## Determinism and seeds
 
-- PPO training now accumulates minibatch scalar metrics (actor loss, critic loss, entropy)
-  on device and performs a single readback per update cycle.
-  This reduces host/device synchronization overhead in tight optimization loops.
+Keep these offsets unchanged for parity:
 
-## Where to edit for specific behavior
+- backend seed: `args.seed`
+- env-pool base seed: `args.seed`
+- initial reset: `args.seed + 10_000`
+- eval pool base: `args.seed + 999`
+- minibatch shuffle RNG: `StdRng::seed_from_u64(args.seed ^ 0xA11CE)`
 
-- Change sampling behavior -> `src/ppo/loss.rs` + rollout action path in `train.rs`.
-- Change optimizer schedule -> LR/decay and epoch/minibatch loops in `train.rs`.
-- Change evaluation behavior -> deterministic eval function in `train.rs`.
-- Change observation handling -> `buffer.rs` parse/flatten + batch tensor assembly in `train.rs`.
+## Auto-reset / One-Strike semantics
 
-Direct links:
+`done=true` step carries terminal reward but next observation/action mask may already belong to the next episode due to worker auto-reset.
 
-- Sampling/loss utilities: [src/ppo/loss.rs](../src/ppo/loss.rs#L1)
-- Optimization/eval loops: [src/ppo/train.rs](../src/ppo/train.rs#L640-L1009)
-- Obs parsing and minibatch extraction: [src/ppo/buffer.rs](../src/ppo/buffer.rs#L33-L510)
+This is expected and must stay consistent in rollout bookkeeping and eval aggregation.
 
-## Determinism & seeding
+## Performance notes
 
-`Args.seed` influences multiple RNG domains. Keep this model in mind when refactoring:
+- Minibatch scalar metrics are accumulated on device, read back once per update.
+- Optimization utilities are shared (`training_utils`) to keep behavior aligned with SPO where applicable.
 
-- **Backend RNG:** `B::seed(&device, args.seed)`
-- **Training env pool seed root:** `args.seed`
-- **Initial reset seed:** `args.seed + 10_000`
-- **Eval pool seed root:** `args.seed + 999`
-  - Deterministic eval pool creation and eval resets.
-- **Minibatch shuffle RNG:** `StdRng::seed_from_u64(args.seed ^ 0xA11CE)`
-  - Governs `all_indices.shuffle(&mut rng)` order.
+## Edit map
 
-### Reproducibility note
-
-If you change minibatch ordering, update ordering, or pool reset timing, you are changing reproducibility characteristics even if loss code is untouched.
-
-## Rollout and buffer behavior
-
-- Dense tasks use flattened `obs` storage.
-- BinPack uses packed structured storage (`items`, `ems`, validity masks).
-- `roll.assert_preallocated()` should remain in update setup to guard memory contracts.
-
-## Invalid action and done semantics
-
-Training receives `done` and `action_mask` from rustpool workers. On `done`, rustpool worker resets env immediately and returns the reset observation with terminal reward/done flag for the just-finished step.
-
-This means a step can carry:
-
-- terminal reward from episode A,
-- next observation/mask already from episode B.
-
-See [Troubleshooting](troubleshooting.md) for the One Strike policy details.
-
-## Practical dependency rule
-
-When changing any item below, always re-check the coupled layer:
-
-- observation shape -> re-check buffer parse + model inputs
-- action dimension -> re-check masks + actor logits shape
-- done/reset semantics -> re-check rollout bookkeeping + eval interpretation
-- seed logic -> re-check env pool seeds + shuffle RNG and reproducibility expectations
-
-Direct links:
-
-- Seed propagation + shuffle RNG: [src/ppo/train.rs](../src/ppo/train.rs#L354-L405)
-- Env seed fan-out: [src/env.rs](../src/env.rs#L76-L88)
+- Sampling/loss behavior: `src/ppo/loss.rs`
+- Optimizer phase: `src/ppo/train.rs` (`PpoOptimizer`)
+- Eval behavior: `src/evaluation.rs` + PPO eval closure in `src/ppo/train.rs`
+- Observation conversion: `src/env_model.rs`
+- Rollout storage: `src/ppo/buffer.rs`

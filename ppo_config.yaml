@@ -12,7 +12,7 @@ environment:
   # rustpool task id (examples: "BinPack-v0", "Maze-v0")
   task_id: "BinPack-v0"
   # Number of parallel training environments
-  num_envs: 10
+  num_envs: 16
   # BinPack-specific max number of items in an instance
   max_items: 20
   # BinPack-specific max number of EMS entries
@@ -22,13 +22,13 @@ environment:
 
 training_core:
   # Trajectory horizon T per environment per PPO update
-  rollout_length: 5
+  rollout_length: 10
   # Total PPO updates
-  num_updates: 10
+  num_updates: 3
   # PPO epochs over each collected rollout buffer
   epochs: 1
   # Number of minibatches per epoch
-  num_minibatches: 1
+  num_minibatches: 16
   # Reward discount factor
   gamma: 0.99
   # GAE lambda
@@ -64,15 +64,15 @@ evaluation:
   # Run deterministic evaluation every N updates
   eval_interval: 1
   # Number of parallel environments used during evaluation
-  num_eval_envs: 10
+  num_eval_envs: 100
   # Number of completed episodes to aggregate per eval phase
-  num_eval_episodes: 10
+  num_eval_episodes: 100
 
 hardware:
   # "cuda" or "cpu"
   device_type: "cuda"
   # CUDA device index used in single-process mode
-  cuda_device: 0
+  cuda_device: 1
 
 logging:
   # Base tracing level used when RUST_LOG is not set
