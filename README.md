@@ -44,6 +44,42 @@ cargo run --release -- --config ppo_config.yaml
 cargo run --release --bin spo -- --config spo_config.yaml
 ```
 
+### Resume from native checkpoint (`.mpk`)
+
+```bash
+cargo run --release --bin ppo -- \
+	--config ppo_config.yaml \
+	--checkpoint-load-path checkpoints/ppo/run_20260217_120000/step_100/agent.mpk
+```
+
+### Initialize from ONNX (offline conversion workflow)
+
+1. Convert ONNX offline and emit a model-only `.mpk`:
+
+```bash
+cargo run --release --features onnx-convert --bin convert_onnx -- \
+	--onnx-path model.onnx \
+	--out-dir generated/onnx \
+	--to-mpk checkpoints/init/agent.mpk \
+	--obs-dim 256 \
+	--hidden-dim 256 \
+	--action-dim 64
+```
+
+2. Start training from the converted `.mpk`:
+
+```bash
+cargo run --release --bin ppo -- \
+	--config ppo_config.yaml \
+	--checkpoint-load-path checkpoints/init/agent.mpk
+```
+
+Notes:
+
+- Runtime load supports `.mpk` only.
+- Full training resume requires optimizer checkpoint files in the same `step_*` folder.
+- Model-only `.mpk` initializes weights and starts optimizer state fresh.
+
 ## Current architecture highlights
 
 - Config loaders are per-binary (`PpoArgs`, `SpoArgs`) on top of a shared schema.

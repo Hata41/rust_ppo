@@ -19,6 +19,7 @@ use crate::algorithms::spo::buffer::ReplayBuffer;
 use crate::algorithms::spo::loss::{compute_discrete_mpo_losses, MpoDuals};
 use crate::algorithms::spo::search::{run_smc_search, SearchConfig};
 use crate::common::runtime::telemetry::TrainingContext;
+use crate::common::utils::checkpointing::{CheckpointConfig, Checkpointer};
 use crate::common::utils::optimization::{clip_global_grad_norm, linear_decay_alpha};
 
 struct SpoOptimizationSummary {
@@ -460,6 +461,34 @@ fn run_loop<B: AutodiffBackend>(
     let mut actor_optim = AdamConfig::new().init::<B, crate::common::model::models::Actor<B>>();
     let mut critic_optim = AdamConfig::new().init::<B, crate::common::model::models::Critic<B>>();
     let mut dual_optim = AdamConfig::new().init::<B, MpoDuals<B>>();
+    let checkpointer = Checkpointer::new(CheckpointConfig::from_args(&args), "spo")?;
+
+    if let Some(load_path) = checkpointer.load_path() {
+        let loaded_step = checkpointer.load_spo(
+            load_path,
+            &mut agent_online,
+            &mut agent_target,
+            &mut duals,
+            &mut actor_optim,
+            &mut critic_optim,
+            &mut dual_optim,
+            &device,
+        )?;
+        if is_lead {
+            info!(
+                category = "MISC",
+                load_path = %load_path.display(),
+                loaded_step = ?loaded_step,
+                "loaded checkpoint"
+            );
+        }
+    } else if is_lead {
+        info!(
+            category = "MISC",
+            "no checkpoint provided; starting SPO from fresh agent state"
+        );
+    }
+
     let mut rng = StdRng::seed_from_u64(args.seed);
     let mut ep_return = vec![0.0f32; args.num_envs];
     let mut ep_len = vec![0usize; args.num_envs];
@@ -744,6 +773,26 @@ fn run_loop<B: AutodiffBackend>(
                     episode_length_min = eval_stats.min_ep_len,
                     duration_ms = eval_duration_ms,
                     "deterministic_eval"
+                );
+            }
+        }
+
+        if checkpointer.should_save(update) {
+            checkpointer.save_spo(
+                update + 1,
+                &agent_online,
+                &agent_target,
+                &duals,
+                &actor_optim,
+                &critic_optim,
+                &dual_optim,
+            )?;
+
+            if is_lead {
+                info!(
+                    category = "MISC",
+                    checkpoint_step = update + 1,
+                    "saved checkpoint"
                 );
             }
         }

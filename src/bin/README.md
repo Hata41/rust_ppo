@@ -4,6 +4,7 @@ Executable entrypoints.
 
 - `ppo.rs`: PPO bootstrap.
 - `spo.rs`: SPO bootstrap.
+- `convert_onnx.rs`: offline ONNX conversion helper (feature-gated by `onnx-convert`).
 
 Each binary performs:
 

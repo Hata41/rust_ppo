@@ -13,6 +13,15 @@ path = "src/bin/ppo.rs"
 name = "spo"
 path = "src/bin/spo.rs"
 
+[[bin]]
+name = "convert_onnx"
+path = "src/bin/convert_onnx.rs"
+required-features = ["onnx-convert"]
+
+[features]
+default = []
+onnx-convert = ["dep:burn-import", "dep:burn-store"]
+
 [dependencies]
 # --- PPO / infra ---
 anyhow = "1"
@@ -39,6 +48,8 @@ rustpool = { path = "../rustpool", package = "_rustpool", default-features = fal
 # --- Burn (CUDA + autodiff) ---
 burn = { version = "=0.20.1", features = ["cuda", "autodiff", "ndarray"] }
 burn-ndarray = "=0.20.1"
+burn-import = { version = "=0.20.1", default-features = false, features = ["onnx"], optional = true }
+burn-store = { version = "=0.20.1", default-features = false, features = ["std", "burnpack"], optional = true }
 cudarc = { version = "=0.18.2", default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-13000"] }
 opentelemetry = "0.28"
 opentelemetry_sdk = { version = "0.28", features = ["rt-tokio"] }

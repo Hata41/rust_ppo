@@ -1,6 +1,9 @@
 # Rust
 target/
 
+# Models
+/checkpoints/
+
 # IDEs
 .vscode/
 .idea/

@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use clap::{parser::ValueSource, ArgMatches, CommandFactory, Parser, ValueEnum};
 use serde::Deserialize;
-use std::path::{Path, PathBuf};
 use std::ops::Deref;
+use std::path::{Path, PathBuf};
 
 #[derive(Copy, Clone, Debug, ValueEnum, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -233,6 +233,22 @@ pub struct Args {
     /// MLflow run ID used to log scalar metrics.
     #[arg(long)]
     pub mlflow_run_id: Option<String>,
+
+    /// Directory used as root for periodic checkpoint artifacts.
+    #[arg(long, default_value = "checkpoints")]
+    pub checkpoint_save_dir: PathBuf,
+
+    /// Number of updates between checkpoint saves.
+    #[arg(long, default_value_t = 100)]
+    pub checkpoint_save_interval: usize,
+
+    /// Optional path to a native Burn checkpoint file (`.mpk`) to resume from.
+    #[arg(long)]
+    pub checkpoint_load_path: Option<PathBuf>,
+
+    /// Optional retention policy for periodic checkpoints.
+    #[arg(long)]
+    pub checkpoint_keep_last_n: Option<usize>,
 }
 
 impl Default for Args {
@@ -290,6 +306,10 @@ impl Default for Args {
             backend_logs_visible: false,
             otlp_endpoint: "http://localhost:5000".to_string(),
             mlflow_run_id: None,
+            checkpoint_save_dir: PathBuf::from("checkpoints"),
+            checkpoint_save_interval: 100,
+            checkpoint_load_path: None,
+            checkpoint_keep_last_n: None,
         }
     }
 }
@@ -306,6 +326,16 @@ struct FileConfig {
     hardware: HardwareConfig,
     spo: SpoConfig,
     logging: LoggingConfig,
+    checkpointing: CheckpointingConfig,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct CheckpointingConfig {
+    save_dir: Option<PathBuf>,
+    save_interval: Option<usize>,
+    load_path: Option<PathBuf>,
+    keep_last_n: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -563,6 +593,15 @@ impl Args {
             self.mlflow_run_id = Some(value);
         }
 
+        set_if_some!(checkpoint_save_dir, file.checkpointing.save_dir);
+        set_if_some!(checkpoint_save_interval, file.checkpointing.save_interval);
+        if let Some(value) = file.checkpointing.load_path {
+            self.checkpoint_load_path = Some(value);
+        }
+        if let Some(value) = file.checkpointing.keep_last_n {
+            self.checkpoint_keep_last_n = Some(value);
+        }
+
         set_if_some!(num_particles, file.spo.num_particles);
         set_if_some!(search_depth, file.spo.search_depth);
         set_if_some!(replay_buffer_size, file.spo.replay_buffer_size);
@@ -637,6 +676,11 @@ impl Args {
         set_if_cli!(backend_logs_visible, "backend_logs_visible");
         set_if_cli!(otlp_endpoint, "otlp_endpoint");
         set_if_cli!(mlflow_run_id, "mlflow_run_id");
+
+        set_if_cli!(checkpoint_save_dir, "checkpoint_save_dir");
+        set_if_cli!(checkpoint_save_interval, "checkpoint_save_interval");
+        set_if_cli!(checkpoint_load_path, "checkpoint_load_path");
+        set_if_cli!(checkpoint_keep_last_n, "checkpoint_keep_last_n");
 
         set_if_cli!(num_particles, "num_particles");
         set_if_cli!(search_depth, "search_depth");

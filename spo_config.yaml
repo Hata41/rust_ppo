@@ -55,6 +55,17 @@ logging:
   # Optional existing MLflow run id; null triggers auto-create on lead rank.
   mlflow_run_id: null
 
+checkpointing:
+  # Root directory for run-scoped checkpoint folders.
+  save_dir: "checkpoints"
+  # Save every N updates.
+  save_interval: 1
+  # Optional native checkpoint file to resume from.
+  # Example: checkpoints/spo/run_20260217_120000/step_100/agent_online.mpk
+  load_path: "checkpoints/spo/run_YYYYMMDD_HHMMSS/step_N/agent_online.mpk"
+  # Optional retention cap for step_* folders inside one run.
+  keep_last_n: null
+
 spo:
   num_particles: 4
   search_depth: 4

@@ -73,7 +73,7 @@ evaluation:
 
 hardware:
   # "cuda" or "cpu"
-  device_type: "cuda"
+  device_type: "cpu"
   # CUDA device index used in single-process mode
   cuda_device: 1
 
@@ -86,3 +86,14 @@ logging:
   otlp_endpoint: "http://localhost:5000"
   # Optional existing MLflow run id; null triggers auto-create on lead rank.
   mlflow_run_id: null
+
+checkpointing:
+  # Root directory for run-scoped checkpoint folders.
+  save_dir: "checkpoints"
+  # Save every N updates.
+  save_interval: 1
+  # Optional native checkpoint file to resume from.
+  # Example: checkpoints/ppo/run_20260217_120000/step_100/agent.mpk
+  load_path: "checkpoints/ppo/run_20260217_180119/step_3/agent.mpk"
+  # Optional retention cap for step_* folders inside one run.
+  keep_last_n: 1

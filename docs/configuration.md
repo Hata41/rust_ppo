@@ -41,6 +41,7 @@ Top-level YAML sections:
 - `evaluation`
 - `hardware`
 - `logging`
+- `checkpointing`
 - `spo`
 
 Compatibility alias:
@@ -135,6 +136,17 @@ SPO-specific:
 - `otlp_endpoint`
 - `mlflow_run_id`
 
+### `checkpointing`
+
+- `save_dir`
+- `save_interval`
+- `load_path`
+- `keep_last_n`
+
+Runtime checkpoint loading accepts only native Burn `.mpk` checkpoint files.
+
+If you start from an external ONNX model, convert it offline first, then pass the produced `.mpk` path as `checkpointing.load_path` (or `--checkpoint-load-path`).
+
 ### `spo`
 
 Search/replay/MPO controls used by SPO trainer.
@@ -183,3 +195,29 @@ With overrides:
 ```bash
 cargo run --release -- --config ppo_config.yaml --task-id Maze-v0 --num-envs 128
 ```
+
+Resume from checkpoint:
+
+```bash
+cargo run --release --bin ppo -- --config ppo_config.yaml --checkpoint-load-path checkpoints/ppo/run_20260217_120000/step_100/agent.mpk
+```
+
+Generate ONNX import artifacts offline:
+
+```bash
+cargo run --release --features onnx-convert --bin convert_onnx -- --onnx-path model.onnx --out-dir generated/onnx
+```
+
+Generate ONNX artifacts and export a model-only `.mpk` initialization checkpoint:
+
+```bash
+cargo run --release --features onnx-convert --bin convert_onnx -- \
+	--onnx-path model.onnx \
+	--out-dir generated/onnx \
+	--to-mpk checkpoints/init/agent.mpk \
+	--obs-dim 256 \
+	--hidden-dim 256 \
+	--action-dim 64
+```
+
+Model-only `.mpk` checkpoints can be passed to `--checkpoint-load-path`; optimizer state will be initialized fresh when optimizer checkpoint files are absent.

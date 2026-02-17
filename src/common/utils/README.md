@@ -5,6 +5,7 @@ Shared low-level utilities consumed by both algorithms.
 ## Files
 
 - `buffer.rs`: flattening and storage helper contracts.
+- `checkpointing.rs`: native Burn checkpoint save/load (model + optimizer states) with retention and model-only init fallback.
 - `optimization.rs`: learning-rate decay and gradient clipping helpers.
 
 ## Contract

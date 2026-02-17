@@ -100,3 +100,30 @@ Checks:
 - verify `CUDA_PATH`/`CUDA_HOME`,
 - verify `LD_LIBRARY_PATH` contains driver/toolkit libraries,
 - verify requested device index exists.
+
+## Checkpoint load failures
+
+Symptoms:
+
+- startup fails when `--checkpoint-load-path` is provided,
+- model initializes but optimizer continuity is missing.
+
+Checks:
+
+- runtime loader accepts `.mpk` only,
+- ensure path points to a Burn-native checkpoint file (not `.onnx`),
+- for full resume, ensure optimizer files are present in same `step_*` directory,
+- for model-only initialization, missing optimizer files are expected and optimizers restart fresh.
+
+## ONNX conversion workflow confusion
+
+Expected workflow:
+
+1. run `convert_onnx` offline,
+2. produce Burn artifacts (`.rs` + `.bpk`) and optionally model-only `.mpk`,
+3. start trainer with `--checkpoint-load-path` pointing to `.mpk`.
+
+Notes:
+
+- ONNX is not loaded directly inside trainer runtime,
+- if tensor mapping is partial during conversion, inspect converter apply summary before training.

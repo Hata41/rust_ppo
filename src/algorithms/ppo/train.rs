@@ -21,6 +21,7 @@ use crate::algorithms::ppo::loss::{
     compute_ppo_losses, logprob_and_entropy, masked_logits, sample_actions_categorical,
 };
 use crate::common::runtime::telemetry::TrainingContext;
+use crate::common::utils::checkpointing::{CheckpointConfig, Checkpointer};
 use crate::common::utils::optimization::{clip_global_grad_norm, linear_decay_alpha};
 
 struct PpoOptimizationSummary {
@@ -418,6 +419,30 @@ fn run_loop<B: AutodiffBackend>(
 
     let mut actor_optim = AdamConfig::new().init::<B, Actor<B>>();
     let mut critic_optim = AdamConfig::new().init::<B, Critic<B>>();
+    let checkpointer = Checkpointer::new(CheckpointConfig::from_args(&args), "ppo")?;
+
+    if let Some(load_path) = checkpointer.load_path() {
+        let loaded_step = checkpointer.load_ppo(
+            load_path,
+            &mut agent,
+            &mut actor_optim,
+            &mut critic_optim,
+            &device,
+        )?;
+        if is_lead {
+            info!(
+                category = "MISC",
+                load_path = %load_path.display(),
+                loaded_step = ?loaded_step,
+                "loaded checkpoint"
+            );
+        }
+    } else if is_lead {
+        info!(
+            category = "MISC",
+            "no checkpoint provided; starting PPO from fresh agent state"
+        );
+    }
 
     let mut ep_return = vec![0.0f32; local_num_envs];
     let mut ep_len = vec![0usize; local_num_envs];
@@ -792,6 +817,18 @@ fn run_loop<B: AutodiffBackend>(
                     episode_length_min = eval_stats.min_ep_len,
                     duration_ms = eval_started.elapsed().as_secs_f64() * 1_000.0,
                     "deterministic_eval"
+                );
+            }
+        }
+
+        if checkpointer.should_save(update) {
+            checkpointer.save_ppo(update + 1, &agent, &actor_optim, &critic_optim)?;
+
+            if is_lead {
+                info!(
+                    category = "MISC",
+                    checkpoint_step = update + 1,
+                    "saved checkpoint"
                 );
             }
         }
