@@ -31,7 +31,12 @@ fn main() -> Result<()> {
             .with_thread_ids(false)
             .with_thread_names(false)
             .event_format(formatter);
-        let otlp_layer = match init_otlp_layer("rust_rl.spo", &args.otlp_endpoint) {
+        let otlp_endpoint = if args.otlp_endpoint.ends_with("/v1/traces") {
+            args.otlp_endpoint.clone()
+        } else {
+            format!("{}/v1/traces", args.otlp_endpoint.trim_end_matches('/'))
+        };
+        let otlp_layer = match init_otlp_layer("rust_rl.spo", &otlp_endpoint, "0") {
             Ok(layer) => Some(layer),
             Err(error) => {
                 eprintln!("failed to initialize OTLP tracing: {error}");

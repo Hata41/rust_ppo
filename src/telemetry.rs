@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fmt;
 use anyhow::Result;
 use opentelemetry::trace::TracerProvider as _;
+use opentelemetry_otlp::WithHttpConfig;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::trace::{BatchConfigBuilder, BatchSpanProcessor, SdkTracerProvider};
 use opentelemetry_sdk::Resource;
@@ -203,10 +204,18 @@ where
 pub fn init_otlp_layer(
     service_name: &str,
     endpoint: &str,
+    experiment_id: &str,
 ) -> Result<OpenTelemetryLayer<Registry, opentelemetry_sdk::trace::Tracer>> {
+    let mut headers = HashMap::new();
+    headers.insert(
+        "x-mlflow-experiment-id".to_string(),
+        experiment_id.to_string(),
+    );
+
     let exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_http()
         .with_endpoint(endpoint)
+        .with_headers(headers)
         .build()?;
 
     let batch_config = BatchConfigBuilder::default()

@@ -93,6 +93,85 @@ Filtering precedence:
 
 Default config behavior keeps CubeCL/CUDA backend context logs hidden to reduce dashboard noise.
 
+## MLflow OTLP over reverse SSH (repeatable runbook)
+
+Use this when training runs on a remote host (e.g. `BareMetal`) and MLflow runs on your laptop.
+
+### Required runtime wiring
+
+- OTLP endpoint must be `http://localhost:5000/v1/traces` on the remote training host.
+- MLflow OTLP header must be present: `x-mlflow-experiment-id` (configured in `src/telemetry.rs`).
+
+### SSH config (laptop)
+
+Example `~/.ssh/config` entry:
+
+```ssh_config
+Host BareMetal
+	HostName 185.144.24.60
+	IdentityFile /home/sreboul/.ssh/id_ed25519
+	User sreboul
+	Port 2223
+	RemoteForward 5000 localhost:5000
+```
+
+### Every-run command order
+
+1) **Laptop / Terminal A**: start MLflow first
+
+```bash
+uv run mlflow server --host 127.0.0.1 --port 5000
+```
+
+2) **Laptop / Terminal B**: keep reverse tunnel open
+
+```bash
+ssh -N BareMetal
+```
+
+Optional debug mode:
+
+```bash
+ssh -vvv -N BareMetal
+```
+
+3) **Remote (`BareMetal`)**: verify tunnel endpoint
+
+```bash
+curl -i http://localhost:5000/
+```
+
+Expected: `HTTP/1.1 200 OK`.
+
+4) **Remote (`BareMetal`)**: run training
+
+```bash
+cargo run --bin ppo -- --config ppo_config.yaml
+cargo run --bin spo -- --config spo_config.yaml
+```
+
+### Quick diagnostics
+
+- `405 Method Not Allowed` at `http://localhost:5000/`:
+	endpoint path is wrong; use `/v1/traces`.
+- `Connection refused` to `http://localhost:5000/v1/traces`:
+	tunnel or local MLflow is down.
+- `ssh -N BareMetal` prints `connect_to localhost port 5000: failed`:
+	local MLflow is not listening yet; start MLflow first, then reconnect SSH.
+
+### Optional direct probe of OTLP route
+
+From `BareMetal`, this checks that POST reaches the traces route and header is accepted:
+
+```bash
+curl -X POST 'http://localhost:5000/v1/traces' \
+	-H 'x-mlflow-experiment-id: 0' \
+	-H 'Content-Type: application/x-protobuf' \
+	--data-binary '' -i
+```
+
+Expected: not `404`/`405`; a `400` with empty payload is acceptable for this probe.
+
 ## Maintenance checklist for telemetry changes
 
 When modifying telemetry:
